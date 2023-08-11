@@ -19,32 +19,27 @@ import (
 	"strings"
 
 	"gvisor.dev/gvisor/pkg/abi"
-	"gvisor.dev/gvisor/pkg/binary"
 )
 
 // Constants for open(2).
 const (
-	O_ACCMODE   = 000000003
-	O_RDONLY    = 000000000
-	O_WRONLY    = 000000001
-	O_RDWR      = 000000002
-	O_CREAT     = 000000100
-	O_EXCL      = 000000200
-	O_NOCTTY    = 000000400
-	O_TRUNC     = 000001000
-	O_APPEND    = 000002000
-	O_NONBLOCK  = 000004000
-	O_DSYNC     = 000010000
-	O_ASYNC     = 000020000
-	O_DIRECT    = 000040000
-	O_LARGEFILE = 000100000
-	O_DIRECTORY = 000200000
-	O_NOFOLLOW  = 000400000
-	O_NOATIME   = 001000000
-	O_CLOEXEC   = 002000000
-	O_SYNC      = 004000000 // __O_SYNC in Linux
-	O_PATH      = 010000000
-	O_TMPFILE   = 020000000 // __O_TMPFILE in Linux
+	O_ACCMODE  = 000000003
+	O_RDONLY   = 000000000
+	O_WRONLY   = 000000001
+	O_RDWR     = 000000002
+	O_CREAT    = 000000100
+	O_EXCL     = 000000200
+	O_NOCTTY   = 000000400
+	O_TRUNC    = 000001000
+	O_APPEND   = 000002000
+	O_NONBLOCK = 000004000
+	O_DSYNC    = 000010000
+	O_ASYNC    = 000020000
+	O_NOATIME  = 001000000
+	O_CLOEXEC  = 002000000
+	O_SYNC     = 004000000 // __O_SYNC in Linux
+	O_PATH     = 010000000
+	O_TMPFILE  = 020000000 // __O_TMPFILE in Linux
 )
 
 // Constants for fstatat(2).
@@ -101,6 +96,11 @@ const (
 	AT_EMPTY_PATH     = 0x1000
 )
 
+// Constants for faccessat2(2).
+const (
+	AT_EACCESS = 0x200
+)
+
 // Constants for all file-related ...at(2) syscalls.
 const (
 	AT_FDCWD = -100
@@ -144,9 +144,13 @@ const (
 	ModeCharacterDevice = S_IFCHR
 	ModeNamedPipe       = S_IFIFO
 
-	ModeSetUID = 04000
-	ModeSetGID = 02000
-	ModeSticky = 01000
+	S_ISUID = 04000
+	S_ISGID = 02000
+	S_ISVTX = 01000
+
+	ModeSetUID = S_ISUID
+	ModeSetGID = S_ISGID
+	ModeSticky = S_ISVTX
 
 	ModeUserAll     = 0700
 	ModeUserRead    = 0400
@@ -176,40 +180,36 @@ const (
 	DT_WHT     = 14
 )
 
+// DirentType are the friendly strings for linux_dirent64.d_type.
+var DirentType = abi.ValueSet{
+	DT_UNKNOWN: "DT_UNKNOWN",
+	DT_FIFO:    "DT_FIFO",
+	DT_CHR:     "DT_CHR",
+	DT_DIR:     "DT_DIR",
+	DT_BLK:     "DT_BLK",
+	DT_REG:     "DT_REG",
+	DT_LNK:     "DT_LNK",
+	DT_SOCK:    "DT_SOCK",
+	DT_WHT:     "DT_WHT",
+}
+
 // Values for preadv2/pwritev2.
 const (
-	// Note: gVisor does not implement the RWF_HIPRI feature, but the flag is
-	// accepted as a valid flag argument for preadv2/pwritev2.
+	// NOTE(b/120162627): gVisor does not implement the RWF_HIPRI feature, but
+	// the flag is accepted as a valid flag argument for preadv2/pwritev2 and
+	// silently ignored.
 	RWF_HIPRI = 0x00000001
 	RWF_DSYNC = 0x00000002
 	RWF_SYNC  = 0x00000004
 	RWF_VALID = RWF_HIPRI | RWF_DSYNC | RWF_SYNC
 )
 
-// Stat represents struct stat.
-type Stat struct {
-	Dev     uint64
-	Ino     uint64
-	Nlink   uint64
-	Mode    uint32
-	UID     uint32
-	GID     uint32
-	_       int32
-	Rdev    uint64
-	Size    int64
-	Blksize int64
-	Blocks  int64
-	ATime   Timespec
-	MTime   Timespec
-	CTime   Timespec
-	_       [3]int64
-}
-
 // SizeOfStat is the size of a Stat struct.
-var SizeOfStat = binary.Size(Stat{})
+var SizeOfStat = (*Stat)(nil).SizeBytes()
 
 // Flags for statx.
 const (
+	AT_NO_AUTOMOUNT       = 0x800
 	AT_STATX_SYNC_TYPE    = 0x6000
 	AT_STATX_SYNC_AS_STAT = 0x0000
 	AT_STATX_FORCE_SYNC   = 0x2000
@@ -247,6 +247,8 @@ const (
 )
 
 // Statx represents struct statx.
+//
+// +marshal boundCheck slice:StatxSlice
 type Statx struct {
 	Mask           uint32
 	Blksize        uint32
@@ -270,8 +272,19 @@ type Statx struct {
 	DevMinor       uint32
 }
 
+// String implements fmt.Stringer.String.
+func (s *Statx) String() string {
+	return fmt.Sprintf("Statx{Mask: %#x, Mode: %s, UID: %d, GID: %d, Ino: %d, DevMajor: %d, DevMinor: %d, Size: %d, Blocks: %d, Blksize: %d, Nlink: %d, Atime: %s, Btime: %s, Ctime: %s, Mtime: %s, Attributes: %d, AttributesMask: %d, RdevMajor: %d, RdevMinor: %d}",
+		s.Mask, FileMode(s.Mode), s.UID, s.GID, s.Ino, s.DevMajor, s.DevMinor, s.Size, s.Blocks, s.Blksize, s.Nlink, s.Atime.ToTime(), s.Btime.ToTime(), s.Ctime.ToTime(), s.Mtime.ToTime(), s.Attributes, s.AttributesMask, s.RdevMajor, s.RdevMinor)
+}
+
+// SizeOfStatx is the size of a Statx struct.
+var SizeOfStatx = (*Statx)(nil).SizeBytes()
+
 // FileMode represents a mode_t.
-type FileMode uint
+//
+// +marshal
+type FileMode uint16
 
 // Permissions returns just the permission bits.
 func (m FileMode) Permissions() FileMode {
@@ -288,6 +301,11 @@ func (m FileMode) ExtraBits() FileMode {
 	return m &^ (PermissionsMask | FileTypeMask)
 }
 
+// IsDir returns true if file type represents a directory.
+func (m FileMode) IsDir() bool {
+	return m.FileType() == S_IFDIR
+}
+
 // String returns a string representation of m.
 func (m FileMode) String() string {
 	var s []string
@@ -299,6 +317,29 @@ func (m FileMode) String() string {
 	}
 	s = append(s, fmt.Sprintf("0o%o", m.Permissions()))
 	return strings.Join(s, "|")
+}
+
+// DirentType maps file types to dirent types appropriate for (struct
+// dirent)::d_type.
+func (m FileMode) DirentType() uint8 {
+	switch m.FileType() {
+	case ModeSocket:
+		return DT_SOCK
+	case ModeSymlink:
+		return DT_LNK
+	case ModeRegular:
+		return DT_REG
+	case ModeBlockDevice:
+		return DT_BLK
+	case ModeDirectory:
+		return DT_DIR
+	case ModeCharacterDevice:
+		return DT_CHR
+	case ModeNamedPipe:
+		return DT_FIFO
+	default:
+		return DT_UNKNOWN
+	}
 }
 
 var modeExtraBits = abi.FlagSet{
@@ -353,4 +394,10 @@ const (
 	FALLOC_FL_ZERO_RANGE     = 0x10
 	FALLOC_FL_INSERT_RANGE   = 0x20
 	FALLOC_FL_UNSHARE_RANGE  = 0x40
+)
+
+// Constants related to close_range(2). Source: /include/uapi/linux/close_range.h
+const (
+	CLOSE_RANGE_UNSHARE = uint32(1 << 1)
+	CLOSE_RANGE_CLOEXEC = uint32(1 << 2)
 )

@@ -18,19 +18,56 @@ package kvm
 import (
 	"fmt"
 	"os"
-	"sync"
-	"syscall"
 
-	"gvisor.dev/gvisor/pkg/cpuid"
+	"golang.org/x/sys/unix"
+	pkgcontext "gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/ring0"
+	"gvisor.dev/gvisor/pkg/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ring0/pagetables"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
+	"gvisor.dev/gvisor/pkg/sync"
 )
+
+// userMemoryRegion is a region of physical memory.
+//
+// This mirrors kvm_memory_region.
+type userMemoryRegion struct {
+	slot          uint32
+	flags         uint32
+	guestPhysAddr uint64
+	memorySize    uint64
+	userspaceAddr uint64
+}
+
+// runData is the run structure. This may be mapped for synchronous register
+// access (although that doesn't appear to be supported by my kernel at least).
+//
+// This mirrors kvm_run.
+type runData struct {
+	requestInterruptWindow uint8
+	_                      [7]uint8
+
+	exitReason                 uint32
+	readyForInterruptInjection uint8
+	ifFlag                     uint8
+	_                          [2]uint8
+
+	cr8      uint64
+	apicBase uint64
+
+	// This is the union data for exits. Interpretation depends entirely on
+	// the exitReason above (see vCPU code for more information).
+	data [32]uint64
+}
 
 // KVM represents a lightweight VM context.
 type KVM struct {
 	platform.NoCPUPreemptionDetection
+
+	// KVM never changes mm_structs.
+	platform.UseHostProcessMemoryBarrier
+
+	platform.DoesOwnPageTables
 
 	// machine is the backing VM.
 	machine *machine
@@ -41,11 +78,15 @@ var (
 	globalErr  error
 )
 
-// OpenDevice opens the KVM device at /dev/kvm and returns the File.
-func OpenDevice() (*os.File, error) {
-	f, err := os.OpenFile("/dev/kvm", syscall.O_RDWR, 0)
+// OpenDevice opens the KVM device and returns the File.
+// If the devicePath is empty, it will default to /dev/kvm.
+func OpenDevice(devicePath string) (*os.File, error) {
+	if devicePath == "" {
+		devicePath = "/dev/kvm"
+	}
+	f, err := os.OpenFile(devicePath, unix.O_RDWR, 0)
 	if err != nil {
-		return nil, fmt.Errorf("error opening /dev/kvm: %v", err)
+		return nil, fmt.Errorf("error opening KVM device file (%s): %v", devicePath, err)
 	}
 	return f, nil
 }
@@ -56,18 +97,26 @@ func New(deviceFile *os.File) (*KVM, error) {
 
 	// Ensure global initialization is done.
 	globalOnce.Do(func() {
-		physicalInit()
-		globalErr = updateSystemValues(int(fd))
-		ring0.Init(cpuid.HostFeatureSet())
+		globalErr = updateGlobalOnce(int(fd))
 	})
 	if globalErr != nil {
 		return nil, globalErr
 	}
 
 	// Create a new VM fd.
-	vm, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, fd, _KVM_CREATE_VM, 0)
-	if errno != 0 {
-		return nil, fmt.Errorf("creating VM: %v", errno)
+	var (
+		vm    uintptr
+		errno unix.Errno
+	)
+	for {
+		vm, _, errno = unix.Syscall(unix.SYS_IOCTL, fd, _KVM_CREATE_VM, 0)
+		if errno == unix.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return nil, fmt.Errorf("creating VM: %v", errno)
+		}
+		break
 	}
 	// We are done with the device file.
 	deviceFile.Close()
@@ -104,28 +153,19 @@ func (*KVM) MapUnit() uint64 {
 }
 
 // MinUserAddress returns the lowest available address.
-func (*KVM) MinUserAddress() usermem.Addr {
-	return usermem.PageSize
+func (*KVM) MinUserAddress() hostarch.Addr {
+	return hostarch.PageSize
 }
 
 // MaxUserAddress returns the first address that may not be used.
-func (*KVM) MaxUserAddress() usermem.Addr {
-	return usermem.Addr(ring0.MaximumUserAddress)
+func (*KVM) MaxUserAddress() hostarch.Addr {
+	return hostarch.Addr(ring0.MaximumUserAddress)
 }
 
 // NewAddressSpace returns a new pagetable root.
-func (k *KVM) NewAddressSpace(_ interface{}) (platform.AddressSpace, <-chan struct{}, error) {
+func (k *KVM) NewAddressSpace(any) (platform.AddressSpace, <-chan struct{}, error) {
 	// Allocate page tables and install system mappings.
-	pageTables := pagetables.New(newAllocator())
-	applyPhysicalRegions(func(pr physicalRegion) bool {
-		// Map the kernel in the upper half.
-		pageTables.Map(
-			usermem.Addr(ring0.KernelStartAddress|pr.virtual),
-			pr.length,
-			pagetables.MapOpts{AccessType: usermem.AnyAccess},
-			pr.physical)
-		return true // Keep iterating.
-	})
+	pageTables := pagetables.NewWithUpper(newAllocator(), k.machine.upperSharedPageTables, ring0.KernelStartAddress)
 
 	// Return the new address space.
 	return &addressSpace{
@@ -136,7 +176,7 @@ func (k *KVM) NewAddressSpace(_ interface{}) (platform.AddressSpace, <-chan stru
 }
 
 // NewContext returns an interruptible context.
-func (k *KVM) NewContext() platform.Context {
+func (k *KVM) NewContext(pkgcontext.Context) platform.Context {
 	return &context{
 		machine: k.machine,
 	}
@@ -148,8 +188,13 @@ func (*constructor) New(f *os.File) (platform.Platform, error) {
 	return New(f)
 }
 
-func (*constructor) OpenDevice() (*os.File, error) {
-	return OpenDevice()
+func (*constructor) OpenDevice(devicePath string) (*os.File, error) {
+	return OpenDevice(devicePath)
+}
+
+// Flags implements platform.Constructor.Flags().
+func (*constructor) Requirements() platform.Requirements {
+	return platform.Requirements{}
 }
 
 func init() {

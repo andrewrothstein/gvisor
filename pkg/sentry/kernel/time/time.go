@@ -19,11 +19,11 @@ package time
 import (
 	"fmt"
 	"math"
-	"sync"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -111,6 +111,12 @@ func FromTimeval(tv linux.Timeval) Time {
 // domain. If t represents walltime, this is nanoseconds since the Unix epoch.
 func (t Time) Nanoseconds() int64 {
 	return t.ns
+}
+
+// Microseconds returns microseconds elapsed since the zero time in t's Clock
+// domain. If t represents walltime, this is microseconds since the Unix epoch.
+func (t Time) Microseconds() int64 {
+	return t.ns / 1000
 }
 
 // Seconds returns seconds elapsed since the zero time in t's Clock domain. If
@@ -245,7 +251,7 @@ type Clock interface {
 type WallRateClock struct{}
 
 // WallTimeUntil implements Clock.WallTimeUntil.
-func (WallRateClock) WallTimeUntil(t, now Time) time.Duration {
+func (*WallRateClock) WallTimeUntil(t, now Time) time.Duration {
 	return t.Sub(now)
 }
 
@@ -254,16 +260,17 @@ func (WallRateClock) WallTimeUntil(t, now Time) time.Duration {
 type NoClockEvents struct{}
 
 // Readiness implements waiter.Waitable.Readiness.
-func (NoClockEvents) Readiness(mask waiter.EventMask) waiter.EventMask {
+func (*NoClockEvents) Readiness(mask waiter.EventMask) waiter.EventMask {
 	return 0
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (NoClockEvents) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
+func (*NoClockEvents) EventRegister(e *waiter.Entry) error {
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
-func (NoClockEvents) EventUnregister(e *waiter.Entry) {
+func (*NoClockEvents) EventUnregister(e *waiter.Entry) {
 }
 
 // ClockEventsQueue implements waiter.Waitable by wrapping waiter.Queue and
@@ -272,24 +279,30 @@ type ClockEventsQueue struct {
 	waiter.Queue
 }
 
+// EventRegister implements waiter.Waitable.
+func (c *ClockEventsQueue) EventRegister(e *waiter.Entry) error {
+	c.Queue.EventRegister(e)
+	return nil
+}
+
 // Readiness implements waiter.Waitable.Readiness.
-func (ClockEventsQueue) Readiness(mask waiter.EventMask) waiter.EventMask {
+func (*ClockEventsQueue) Readiness(mask waiter.EventMask) waiter.EventMask {
 	return 0
 }
 
-// A TimerListener receives expirations from a Timer.
-type TimerListener interface {
-	// Notify is called when its associated Timer expires. exp is the number of
-	// expirations.
+// Listener receives expirations from a Timer.
+type Listener interface {
+	// NotifyTimer is called when its associated Timer expires. exp is the number
+	// of expirations. setting is the next timer Setting.
 	//
 	// Notify is called with the associated Timer's mutex locked, so Notify
 	// must not take any locks that precede Timer.mu in lock order.
 	//
+	// If Notify returns true, the timer will use the returned setting
+	// rather than the passed one.
+	//
 	// Preconditions: exp > 0.
-	Notify(exp uint64)
-
-	// Destroy is called when the timer is destroyed.
-	Destroy()
+	NotifyTimer(exp uint64, setting Setting) (newSetting Setting, update bool)
 }
 
 // Setting contains user-controlled mutable Timer properties.
@@ -319,7 +332,7 @@ func SettingFromSpec(value time.Duration, interval time.Duration, c Clock) (Sett
 // interpreted as a time relative to now.
 func SettingFromSpecAt(value time.Duration, interval time.Duration, now Time) (Setting, error) {
 	if value < 0 {
-		return Setting{}, syserror.EINVAL
+		return Setting{}, linuxerr.EINVAL
 	}
 	if value == 0 {
 		return Setting{Period: interval}, nil
@@ -335,7 +348,7 @@ func SettingFromSpecAt(value time.Duration, interval time.Duration, now Time) (S
 // interpreted as an absolute time.
 func SettingFromAbsSpec(value Time, interval time.Duration) (Setting, error) {
 	if value.Before(ZeroTime) {
-		return Setting{}, syserror.EINVAL
+		return Setting{}, linuxerr.EINVAL
 	}
 	if value.IsZero() {
 		return Setting{Period: interval}, nil
@@ -412,7 +425,7 @@ type Timer struct {
 	clock Clock
 
 	// listener is notified of expirations. listener is immutable.
-	listener TimerListener
+	listener Listener
 
 	// mu protects the following mutable fields.
 	mu sync.Mutex `state:"nosave"`
@@ -446,32 +459,13 @@ const timerTickEvents = ClockEventSet | ClockEventRateIncrease
 // NewTimer returns a new Timer that will obtain time from clock and send
 // expirations to listener. The Timer is initially stopped and has no first
 // expiration or period configured.
-func NewTimer(clock Clock, listener TimerListener) *Timer {
+func NewTimer(clock Clock, listener Listener) *Timer {
 	t := &Timer{
 		clock:    clock,
 		listener: listener,
 	}
 	t.init()
 	return t
-}
-
-// After waits for the duration to elapse according to clock and then sends a
-// notification on the returned channel. The timer is started immediately and
-// will fire exactly once. The second return value is the start time used with
-// the duration.
-//
-// Callers must call Timer.Destroy.
-func After(clock Clock, duration time.Duration) (*Timer, Time, <-chan struct{}) {
-	notifier, tchan := NewChannelNotifier()
-	t := NewTimer(clock, notifier)
-	now := clock.Now()
-
-	t.Swap(Setting{
-		Enabled: true,
-		Period:  0,
-		Next:    now.Add(duration),
-	})
-	return t, now, tchan
 }
 
 // init initializes Timer state that is not preserved across save/restore. If
@@ -486,8 +480,10 @@ func (t *Timer) init() {
 	// If t.kicker is nil, the Timer goroutine can't be running, so we can't
 	// race with it.
 	t.kicker = time.NewTimer(0)
-	t.entry, t.events = waiter.NewChannelEntry(nil)
-	t.clock.EventRegister(&t.entry, timerTickEvents)
+	t.entry, t.events = waiter.NewChannelEntry(timerTickEvents)
+	if err := t.clock.EventRegister(&t.entry); err != nil {
+		panic(err)
+	}
 	go t.runGoroutine() // S/R-SAFE: synchronized by t.mu
 }
 
@@ -504,7 +500,6 @@ func (t *Timer) Destroy() {
 	// before closing t.events to instruct the Timer goroutine to exit.
 	t.clock.EventUnregister(&t.entry)
 	close(t.events)
-	t.listener.Destroy()
 }
 
 func (t *Timer) runGoroutine() {
@@ -533,7 +528,9 @@ func (t *Timer) Tick() {
 	s, exp := t.setting.At(now)
 	t.setting = s
 	if exp > 0 {
-		t.listener.Notify(exp)
+		if newS, ok := t.listener.NotifyTimer(exp, t.setting); ok {
+			t.setting = newS
+		}
 	}
 	t.resetKickerLocked(now)
 }
@@ -588,7 +585,9 @@ func (t *Timer) Get() (Time, Setting) {
 	s, exp := t.setting.At(now)
 	t.setting = s
 	if exp > 0 {
-		t.listener.Notify(exp)
+		if newS, ok := t.listener.NotifyTimer(exp, t.setting); ok {
+			t.setting = newS
+		}
 	}
 	t.resetKickerLocked(now)
 	return now, s
@@ -609,8 +608,10 @@ func (t *Timer) Swap(s Setting) (Time, Setting) {
 // Timer's Clock) at which the Setting was changed. Setting s.Enabled to true
 // starts the timer, while setting s.Enabled to false stops it.
 //
-// Preconditions: The Timer must not be paused. f cannot call any Timer methods
-// since it is called with the Timer mutex locked.
+// Preconditions:
+//   - The Timer must not be paused.
+//   - f cannot call any Timer methods since it is called with the Timer mutex
+//     locked.
 func (t *Timer) SwapAnd(s Setting, f func()) (Time, Setting) {
 	now := t.clock.Now()
 	t.mu.Lock()
@@ -620,7 +621,9 @@ func (t *Timer) SwapAnd(s Setting, f func()) (Time, Setting) {
 	}
 	oldS, oldExp := t.setting.At(now)
 	if oldExp > 0 {
-		t.listener.Notify(oldExp)
+		t.listener.NotifyTimer(oldExp, oldS)
+		// N.B. The returned Setting doesn't matter because we're about
+		// to overwrite.
 	}
 	if f != nil {
 		f()
@@ -628,7 +631,9 @@ func (t *Timer) SwapAnd(s Setting, f func()) (Time, Setting) {
 	newS, newExp := s.At(now)
 	t.setting = newS
 	if newExp > 0 {
-		t.listener.Notify(newExp)
+		if newS, ok := t.listener.NotifyTimer(newExp, t.setting); ok {
+			t.setting = newS
+		}
 	}
 	t.resetKickerLocked(now)
 	return now, oldS
@@ -664,33 +669,26 @@ func (t *Timer) Clock() Clock {
 	return t.clock
 }
 
-// ChannelNotifier is a TimerListener that sends a message on an empty struct
-// channel.
+// ChannelNotifier is a Listener that sends on a channel.
 //
 // ChannelNotifier cannot be saved or loaded.
-type ChannelNotifier struct {
-	// tchan must be a buffered channel.
-	tchan chan struct{}
-}
+type ChannelNotifier chan struct{}
 
 // NewChannelNotifier creates a new channel notifier.
 //
 // If the notifier is used with a timer, Timer.Destroy will close the channel
 // returned here.
-func NewChannelNotifier() (TimerListener, <-chan struct{}) {
+func NewChannelNotifier() (Listener, <-chan struct{}) {
 	tchan := make(chan struct{}, 1)
-	return &ChannelNotifier{tchan}, tchan
+	return ChannelNotifier(tchan), tchan
 }
 
-// Notify implements ktime.TimerListener.Notify.
-func (c *ChannelNotifier) Notify(uint64) {
+// NotifyTimer implements Listener.NotifyTimer.
+func (c ChannelNotifier) NotifyTimer(uint64, Setting) (Setting, bool) {
 	select {
-	case c.tchan <- struct{}{}:
+	case c <- struct{}{}:
 	default:
 	}
-}
 
-// Destroy implements ktime.TimerListener.Destroy and will close the channel.
-func (c *ChannelNotifier) Destroy() {
-	close(c.tchan)
+	return Setting{}, false
 }

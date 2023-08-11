@@ -15,13 +15,19 @@
 package kernel
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/sched"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
-	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 // TaskConfig defines the configuration of a new Task (see below).
@@ -42,10 +48,10 @@ type TaskConfig struct {
 	// SignalMask is the new task's initial signal mask.
 	SignalMask linux.SignalSet
 
-	// TaskContext is the TaskContext of the new task. Ownership of the
-	// TaskContext is transferred to TaskSet.NewTask, whether or not it
+	// TaskImage is the TaskImage of the new task. Ownership of the
+	// TaskImage is transferred to TaskSet.NewTask, whether or not it
 	// succeeds.
-	TaskContext *TaskContext
+	TaskImage *TaskImage
 
 	// FSContext is the FSContext of the new task. A reference must be held on
 	// FSContext, which is transferred to TaskSet.NewTask whether or not it
@@ -63,9 +69,8 @@ type TaskConfig struct {
 	// Niceness is the niceness of the new task.
 	Niceness int
 
-	// If NetworkNamespaced is true, the new task should observe a non-root
-	// network namespace.
-	NetworkNamespaced bool
+	// NetworkNamespace is the network namespace to be used for the new task.
+	NetworkNamespace *inet.Namespace
 
 	// AllowedCPUMask contains the cpus that this task can run on.
 	AllowedCPUMask sched.CPUSet
@@ -79,19 +84,53 @@ type TaskConfig struct {
 	// AbstractSocketNamespace is the AbstractSocketNamespace of the new task.
 	AbstractSocketNamespace *AbstractSocketNamespace
 
+	// MountNamespace is the MountNamespace of the new task.
+	MountNamespace *vfs.MountNamespace
+
+	// RSeqAddr is a pointer to the the userspace linux.RSeq structure.
+	RSeqAddr hostarch.Addr
+
+	// RSeqSignature is the signature that the rseq abort IP must be signed
+	// with.
+	RSeqSignature uint32
+
 	// ContainerID is the container the new task belongs to.
 	ContainerID string
+
+	// InitialCgroups are the cgroups the container is initialised to.
+	InitialCgroups map[Cgroup]struct{}
+
+	// UserCounters is user resource counters.
+	UserCounters *userCounters
 }
 
 // NewTask creates a new task defined by cfg.
 //
 // NewTask does not start the returned task; the caller must call Task.Start.
-func (ts *TaskSet) NewTask(cfg *TaskConfig) (*Task, error) {
-	t, err := ts.newTask(cfg)
+//
+// If successful, NewTask transfers references held by cfg to the new task.
+// Otherwise, NewTask releases them.
+func (ts *TaskSet) NewTask(ctx context.Context, cfg *TaskConfig) (*Task, error) {
+	var err error
+	cleanup := func() {
+		cfg.TaskImage.release(ctx)
+		cfg.FSContext.DecRef(ctx)
+		cfg.FDTable.DecRef(ctx)
+		cfg.UTSNamespace.DecRef(ctx)
+		cfg.IPCNamespace.DecRef(ctx)
+		cfg.NetworkNamespace.DecRef(ctx)
+		if cfg.MountNamespace != nil {
+			cfg.MountNamespace.DecRef(ctx)
+		}
+	}
+	if err := cfg.UserCounters.incRLimitNProc(ctx); err != nil {
+		cleanup()
+		return nil, err
+	}
+	t, err := ts.newTask(ctx, cfg)
 	if err != nil {
-		cfg.TaskContext.release()
-		cfg.FSContext.DecRef()
-		cfg.FDTable.DecRef()
+		cfg.UserCounters.decRLimitNProc()
+		cleanup()
 		return nil, err
 	}
 	return t, nil
@@ -99,9 +138,10 @@ func (ts *TaskSet) NewTask(cfg *TaskConfig) (*Task, error) {
 
 // newTask is a helper for TaskSet.NewTask that only takes ownership of parts
 // of cfg if it succeeds.
-func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
+func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) {
+	srcT := TaskFromContext(ctx)
 	tg := cfg.ThreadGroup
-	tc := cfg.TaskContext
+	image := cfg.TaskImage
 	t := &Task{
 		taskNode: taskNode{
 			tg:       tg,
@@ -110,30 +150,65 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 		},
 		runState:        (*runApp)(nil),
 		interruptChan:   make(chan struct{}, 1),
-		signalMask:      cfg.SignalMask,
-		signalStack:     arch.SignalStack{Flags: arch.SignalStackFlagDisable},
-		tc:              *tc,
+		signalMask:      atomicbitops.FromUint64(uint64(cfg.SignalMask)),
+		signalStack:     linux.SignalStack{Flags: linux.SS_DISABLE},
+		image:           *image,
 		fsContext:       cfg.FSContext,
 		fdTable:         cfg.FDTable,
-		p:               cfg.Kernel.Platform.NewContext(),
 		k:               cfg.Kernel,
 		ptraceTracees:   make(map[*Task]struct{}),
 		allowedCPUMask:  cfg.AllowedCPUMask.Copy(),
 		ioUsage:         &usage.IO{},
 		niceness:        cfg.Niceness,
-		netns:           cfg.NetworkNamespaced,
 		utsns:           cfg.UTSNamespace,
 		ipcns:           cfg.IPCNamespace,
 		abstractSockets: cfg.AbstractSocketNamespace,
+		mountNamespace:  cfg.MountNamespace,
 		rseqCPU:         -1,
+		rseqAddr:        cfg.RSeqAddr,
+		rseqSignature:   cfg.RSeqSignature,
 		futexWaiter:     futex.NewWaiter(),
 		containerID:     cfg.ContainerID,
+		cgroups:         make(map[Cgroup]struct{}),
+		userCounters:    cfg.UserCounters,
 	}
+	t.netns = cfg.NetworkNamespace
 	t.creds.Store(cfg.Credentials)
 	t.endStopCond.L = &t.tg.signalHandlers.mu
 	t.ptraceTracer.Store((*Task)(nil))
 	// We don't construct t.blockingTimer until Task.run(); see that function
 	// for justification.
+
+	var (
+		cg                 Cgroup
+		charged, committed bool
+	)
+
+	// Reserve cgroup PIDs controller charge. This is either commited when the
+	// new task enters the cgroup below, or rolled back on failure.
+	//
+	// We may also get here from a non-task context (for example, when
+	// creating the init task, or from the exec control command). In these cases
+	// we skip charging the pids controller, as non-userspace task creation
+	// bypasses pid limits.
+	if srcT != nil {
+		var err error
+		if charged, cg, err = srcT.ChargeFor(t, CgroupControllerPIDs, CgroupResourcePID, 1); err != nil {
+			return nil, err
+		}
+		if charged {
+			defer func() {
+				if !committed {
+					if err := cg.Charge(t, cg.Dentry, CgroupControllerPIDs, CgroupResourcePID, -1); err != nil {
+						panic(fmt.Sprintf("Failed to clean up PIDs charge on task creation failure: %v", err))
+					}
+				}
+				// Ref from ChargeFor. Note that we need to drop this outside of
+				// TaskSet.mu critical sections.
+				cg.DecRef(ctx)
+			}()
+		}
+	}
 
 	// Make the new task (and possibly thread group) visible to the rest of
 	// the system atomically.
@@ -146,7 +221,7 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 		// doesn't matter too much since the caller will exit before it returns
 		// to userspace. If the caller isn't in the same thread group, then
 		// we're in uncharted territory and can return whatever we want.
-		return nil, syserror.EINTR
+		return nil, linuxerr.EINTR
 	}
 	if err := ts.assignTIDsLocked(t); err != nil {
 		return nil, err
@@ -154,10 +229,10 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 	// Below this point, newTask is expected not to fail (there is no rollback
 	// of assignTIDsLocked or any of the following).
 
-	// Logging on t's behalf will panic if t.logPrefix hasn't been initialized.
-	// This is the earliest point at which we can do so (since t now has thread
-	// IDs).
-	t.updateLogPrefixLocked()
+	// Logging on t's behalf will panic if t.logPrefix hasn't been
+	// initialized. This is the earliest point at which we can do so
+	// (since t now has thread IDs).
+	t.updateInfoLocked()
 
 	if cfg.InheritParent != nil {
 		t.parent = cfg.InheritParent.parent
@@ -166,15 +241,29 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 		t.parent.children[t] = struct{}{}
 	}
 
+	// If InitialCgroups is not nil, the new task will be placed in the
+	// specified cgroups. Otherwise, if srcT is not nil, the new task will
+	// be placed in the srcT's cgroups. If neither is specified, the new task
+	// will be in the root cgroups.
+	t.EnterInitialCgroups(srcT, cfg.InitialCgroups)
+	committed = true
+
 	if tg.leader == nil {
 		// New thread group.
 		tg.leader = t
 		if parentPG := tg.parentPG(); parentPG == nil {
 			tg.createSession()
 		} else {
-			// Inherit the process group.
+			// Inherit the process group and terminal.
 			parentPG.incRefWithParent(parentPG)
 			tg.processGroup = parentPG
+			tg.tty = t.parent.tg.tty
+		}
+
+		// If our parent is a child subreaper, or if it has a child
+		// subreaper, then this new thread group does as well.
+		if t.parent != nil {
+			tg.hasChildSubreaper = t.parent.tg.isChildSubreaper || t.parent.tg.hasChildSubreaper
 		}
 	}
 	tg.tasks.PushBack(t)
@@ -183,14 +272,18 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 	tg.activeTasks++
 
 	// Propagate external TaskSet stops to the new task.
-	t.stopCount = ts.stopCount
+	t.stopCount = atomicbitops.FromInt32(ts.stopCount)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.cpu = assignCPU(t.allowedCPUMask, ts.Root.tids[t])
+	t.cpu = atomicbitops.FromInt32(assignCPU(t.allowedCPUMask, ts.Root.tids[t]))
 
 	t.startTime = t.k.RealtimeClock().Now()
+
+	// As a final step, initialize the platform context. This may require
+	// other pieces to be initialized as the task is used the context.
+	t.p = cfg.Kernel.Platform.NewContext(t.AsyncContext())
 
 	return t, nil
 }
@@ -205,28 +298,26 @@ func (ts *TaskSet) assignTIDsLocked(t *Task) error {
 		tid ThreadID
 	}
 	var allocatedTIDs []allocatedTID
+	var tid ThreadID
+	var err error
 	for ns := t.tg.pidns; ns != nil; ns = ns.parent {
-		tid, err := ns.allocateTID()
-		if err != nil {
-			// Failure. Remove the tids we already allocated in descendant
-			// namespaces.
-			for _, a := range allocatedTIDs {
-				delete(a.ns.tasks, a.tid)
-				delete(a.ns.tids, t)
-				if t.tg.leader == nil {
-					delete(a.ns.tgids, t.tg)
-				}
-			}
-			return err
+		if tid, err = ns.allocateTID(); err != nil {
+			break
 		}
-		ns.tasks[tid] = t
-		ns.tids[t] = tid
-		if t.tg.leader == nil {
-			// New thread group.
-			ns.tgids[t.tg] = tid
+		if err = ns.addTask(t, tid); err != nil {
+			break
 		}
 		allocatedTIDs = append(allocatedTIDs, allocatedTID{ns, tid})
 	}
+	if err != nil {
+		// Failure. Remove the tids we already allocated in descendant
+		// namespaces.
+		for _, a := range allocatedTIDs {
+			a.ns.deleteTask(t)
+		}
+		return err
+	}
+	t.tg.pidWithinNS.Store(int32(t.tg.pidns.tgids[t.tg]))
 	return nil
 }
 
@@ -239,14 +330,14 @@ func (ns *PIDNamespace) allocateTID() (ThreadID, error) {
 		// fail with the error ENOMEM; it is not possible to create a new
 		// processes [sic] in a PID namespace whose init process has
 		// terminated." - pid_namespaces(7)
-		return 0, syserror.ENOMEM
+		return 0, linuxerr.ENOMEM
 	}
 	tid := ns.last
 	for {
 		// Next.
 		tid++
 		if tid > TasksLimit {
-			tid = InitTID + 1
+			tid = initTID + 1
 		}
 
 		// Is it available?
@@ -271,7 +362,7 @@ func (ns *PIDNamespace) allocateTID() (ThreadID, error) {
 		// Did we do a full cycle?
 		if tid == ns.last {
 			// No tid available.
-			return 0, syserror.EAGAIN
+			return 0, linuxerr.EAGAIN
 		}
 	}
 }

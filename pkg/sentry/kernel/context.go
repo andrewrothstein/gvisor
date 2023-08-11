@@ -15,8 +15,8 @@
 package kernel
 
 import (
-	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/context"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
 )
 
 // contextID is the kernel package's type for context.Context.Value keys.
@@ -38,9 +38,6 @@ const (
 
 	// CtxUTSNamespace is a Context.Value key for a UTSNamespace.
 	CtxUTSNamespace
-
-	// CtxIPCNamespace is a Context.Value key for a IPCNamespace.
-	CtxIPCNamespace
 )
 
 // ContextCanTrace returns true if ctx is permitted to trace t, in the same sense
@@ -80,9 +77,10 @@ func UTSNamespaceFromContext(ctx context.Context) *UTSNamespace {
 }
 
 // IPCNamespaceFromContext returns the IPC namespace in which ctx is executing,
-// or nil if there is no such IPC namespace.
+// or nil if there is no such IPC namespace. It takes a reference on the
+// namespace.
 func IPCNamespaceFromContext(ctx context.Context) *IPCNamespace {
-	if v := ctx.Value(CtxIPCNamespace); v != nil {
+	if v := ctx.Value(ipc.CtxIPCNamespace); v != nil {
 		return v.(*IPCNamespace)
 	}
 	return nil
@@ -95,41 +93,4 @@ func TaskFromContext(ctx context.Context) *Task {
 		return v.(*Task)
 	}
 	return nil
-}
-
-// AsyncContext returns a context.Context that may be used by goroutines that
-// do work on behalf of t and therefore share its contextual values, but are
-// not t's task goroutine (e.g. asynchronous I/O).
-func (t *Task) AsyncContext() context.Context {
-	return taskAsyncContext{t: t}
-}
-
-type taskAsyncContext struct {
-	context.NoopSleeper
-	t *Task
-}
-
-// Debugf implements log.Logger.Debugf.
-func (ctx taskAsyncContext) Debugf(format string, v ...interface{}) {
-	ctx.t.Debugf(format, v...)
-}
-
-// Infof implements log.Logger.Infof.
-func (ctx taskAsyncContext) Infof(format string, v ...interface{}) {
-	ctx.t.Infof(format, v...)
-}
-
-// Warningf implements log.Logger.Warningf.
-func (ctx taskAsyncContext) Warningf(format string, v ...interface{}) {
-	ctx.t.Warningf(format, v...)
-}
-
-// IsLogging implements log.Logger.IsLogging.
-func (ctx taskAsyncContext) IsLogging(level log.Level) bool {
-	return ctx.t.IsLogging(level)
-}
-
-// Value implements context.Context.Value.
-func (ctx taskAsyncContext) Value(key interface{}) interface{} {
-	return ctx.t.Value(key)
 }

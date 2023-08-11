@@ -19,8 +19,12 @@ package linux
 // See linux/magic.h.
 const (
 	ANON_INODE_FS_MAGIC   = 0x09041934
+	CGROUP_SUPER_MAGIC    = 0x27e0eb
 	DEVPTS_SUPER_MAGIC    = 0x00001cd1
 	EXT_SUPER_MAGIC       = 0xef53
+	FUSE_SUPER_MAGIC      = 0x65735546
+	MQUEUE_MAGIC          = 0x19800202
+	NSFS_MAGIC            = 0x6e736673
 	OVERLAYFS_SUPER_MAGIC = 0x794c7630
 	PIPEFS_MAGIC          = 0x50495045
 	PROC_SUPER_MAGIC      = 0x9fa0
@@ -38,21 +42,24 @@ const (
 )
 
 // Statfs is struct statfs, from uapi/asm-generic/statfs.h.
+//
+// +marshal
 type Statfs struct {
 	// Type is one of the filesystem magic values, defined above.
 	Type uint64
 
-	// BlockSize is the data block size.
+	// BlockSize is the optimal transfer block size in bytes.
 	BlockSize int64
 
-	// Blocks is the number of data blocks in use.
+	// Blocks is the maximum number of data blocks the filesystem may store, in
+	// units of BlockSize.
 	Blocks uint64
 
-	// BlocksFree is the number of free blocks.
+	// BlocksFree is the number of free data blocks, in units of BlockSize.
 	BlocksFree uint64
 
-	// BlocksAvailable is the number of blocks free for use by
-	// unprivileged users.
+	// BlocksAvailable is the number of data blocks free for use by
+	// unprivileged users, in units of BlockSize.
 	BlocksAvailable uint64
 
 	// Files is the number of used file nodes on the filesystem.
@@ -91,4 +98,11 @@ const (
 	SYNC_FILE_RANGE_WAIT_BEFORE = 1
 	SYNC_FILE_RANGE_WRITE       = 2
 	SYNC_FILE_RANGE_WAIT_AFTER  = 4
+)
+
+// Flag argument to renameat2(2), from include/uapi/linux/fs.h.
+const (
+	RENAME_NOREPLACE = (1 << 0) // Don't overwrite target.
+	RENAME_EXCHANGE  = (1 << 1) // Exchange src and dst.
+	RENAME_WHITEOUT  = (1 << 2) // Whiteout src.
 )

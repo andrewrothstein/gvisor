@@ -16,11 +16,11 @@ package kvm
 
 import (
 	"fmt"
-	"reflect"
-	"syscall"
 
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/platform/safecopy"
+	"gvisor.dev/gvisor/pkg/sighandling"
 )
 
 // bluepill enters guest mode.
@@ -35,15 +35,49 @@ func sighandler()
 // dieArchSetup and the assembly implementation for dieTrampoline.
 func dieTrampoline()
 
+// Return the start address of the functions above.
+//
+// In Go 1.17+, Go references to assembly functions resolve to an ABIInternal
+// wrapper function rather than the function itself. We must reference from
+// assembly to get the ABI0 (i.e., primary) address.
+func addrOfSighandler() uintptr
+func addrOfDieTrampoline() uintptr
+
 var (
+	// bounceSignal is the signal used for bouncing KVM.
+	//
+	// We use SIGCHLD because it is not masked by the runtime, and
+	// it will be ignored properly by other parts of the kernel.
+	bounceSignal = unix.SIGCHLD
+
+	// bounceSignalMask has only bounceSignal set.
+	bounceSignalMask = uint64(1 << (uint64(bounceSignal) - 1))
+
+	// bounce is the interrupt vector used to return to the kernel.
+	bounce = uint32(ring0.VirtualizationException)
+
 	// savedHandler is a pointer to the previous handler.
 	//
 	// This is called by bluepillHandler.
 	savedHandler uintptr
 
+	// savedSigsysHandler is a pointer to the previos handler of the SIGSYS signals.
+	savedSigsysHandler uintptr
+
 	// dieTrampolineAddr is the address of dieTrampoline.
 	dieTrampolineAddr uintptr
 )
+
+// _SYS_KVM_RETURN_TO_HOST is the system call that is used to transition
+// to host.
+const _SYS_KVM_RETURN_TO_HOST = ^uintptr(0)
+
+// redpill invokes a syscall with -1.
+//
+//go:nosplit
+func redpill() {
+	unix.RawSyscall(_SYS_KVM_RETURN_TO_HOST, 0, 0, 0)
+}
 
 // dieHandler is called by dieTrampoline.
 //
@@ -61,22 +95,16 @@ func (c *vCPU) die(context *arch.SignalContext64, msg string) {
 	// Save the death message, which will be thrown.
 	c.dieState.message = msg
 
-	// Reload all registers to have an accurate stack trace when we return
-	// to host mode. This means that the stack should be unwound correctly.
-	if errno := c.getUserRegisters(&c.dieState.guestRegs); errno != 0 {
-		throw(msg)
-	}
-
 	// Setup the trampoline.
 	dieArchSetup(c, context, &c.dieState.guestRegs)
 }
 
 func init() {
 	// Install the handler.
-	if err := safecopy.ReplaceSignalHandler(syscall.SIGSEGV, reflect.ValueOf(sighandler).Pointer(), &savedHandler); err != nil {
-		panic(fmt.Sprintf("Unable to set handler for signal %d: %v", syscall.SIGSEGV, err))
+	if err := sighandling.ReplaceSignalHandler(bluepillSignal, addrOfSighandler(), &savedHandler); err != nil {
+		panic(fmt.Sprintf("Unable to set handler for signal %d: %v", bluepillSignal, err))
 	}
 
 	// Extract the address for the trampoline.
-	dieTrampolineAddr = reflect.ValueOf(dieTrampoline).Pointer()
+	dieTrampolineAddr = addrOfDieTrampoline()
 }

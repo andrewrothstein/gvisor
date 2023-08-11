@@ -16,7 +16,6 @@ package udp
 
 import (
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -44,12 +43,11 @@ func NewForwarder(s *stack.Stack, handler func(*ForwarderRequest)) *Forwarder {
 //
 // This function is expected to be passed as an argument to the
 // stack.SetTransportProtocolHandler function.
-func (f *Forwarder) HandlePacket(r *stack.Route, id stack.TransportEndpointID, netHeader buffer.View, vv buffer.VectorisedView) bool {
+func (f *Forwarder) HandlePacket(id stack.TransportEndpointID, pkt stack.PacketBufferPtr) bool {
 	f.handler(&ForwarderRequest{
 		stack: f.stack,
-		route: r,
 		id:    id,
-		vv:    vv,
+		pkt:   pkt.IncRef(),
 	})
 
 	return true
@@ -60,9 +58,8 @@ func (f *Forwarder) HandlePacket(r *stack.Route, id stack.TransportEndpointID, n
 // it via CreateEndpoint.
 type ForwarderRequest struct {
 	stack *stack.Stack
-	route *stack.Route
 	id    stack.TransportEndpointID
-	vv    buffer.VectorisedView
+	pkt   stack.PacketBufferPtr
 }
 
 // ID returns the 4-tuple (src address, src port, dst address, dst port) that
@@ -72,25 +69,35 @@ func (r *ForwarderRequest) ID() stack.TransportEndpointID {
 }
 
 // CreateEndpoint creates a connected UDP endpoint for the session request.
-func (r *ForwarderRequest) CreateEndpoint(queue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
-	ep := newEndpoint(r.stack, r.route.NetProto, queue)
-	if err := r.stack.RegisterTransportEndpoint(r.route.NICID(), []tcpip.NetworkProtocolNumber{r.route.NetProto}, ProtocolNumber, r.id, ep, ep.reusePort); err != nil {
+func (r *ForwarderRequest) CreateEndpoint(queue *waiter.Queue) (tcpip.Endpoint, tcpip.Error) {
+	ep := newEndpoint(r.stack, r.pkt.NetworkProtocolNumber, queue)
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+
+	netHdr := r.pkt.Network()
+	if err := ep.net.Bind(tcpip.FullAddress{NIC: r.pkt.NICID, Addr: netHdr.DestinationAddress(), Port: r.id.LocalPort}); err != nil {
+		return nil, err
+	}
+
+	if err := ep.net.Connect(tcpip.FullAddress{NIC: r.pkt.NICID, Addr: netHdr.SourceAddress(), Port: r.id.RemotePort}); err != nil {
+		return nil, err
+	}
+
+	if err := r.stack.RegisterTransportEndpoint([]tcpip.NetworkProtocolNumber{r.pkt.NetworkProtocolNumber}, ProtocolNumber, r.id, ep, ep.portFlags, tcpip.NICID(ep.ops.GetBindToDevice())); err != nil {
 		ep.Close()
 		return nil, err
 	}
 
-	ep.id = r.id
-	ep.route = r.route.Clone()
-	ep.dstPort = r.id.RemotePort
-	ep.regNICID = r.route.NICID()
-
-	ep.state = StateConnected
+	ep.localPort = r.id.LocalPort
+	ep.remotePort = r.id.RemotePort
+	ep.effectiveNetProtos = []tcpip.NetworkProtocolNumber{r.pkt.NetworkProtocolNumber}
+	ep.boundPortFlags = ep.portFlags
 
 	ep.rcvMu.Lock()
 	ep.rcvReady = true
 	ep.rcvMu.Unlock()
 
-	ep.HandlePacket(r.route, r.id, r.vv)
+	ep.HandlePacket(r.id, r.pkt)
 
 	return ep, nil
 }

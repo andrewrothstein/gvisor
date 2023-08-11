@@ -6,159 +6,276 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *AtomicPtrCredentials) beforeSave() {}
-func (x *AtomicPtrCredentials) save(m state.Map) {
-	x.beforeSave()
-	var ptr *Credentials = x.savePtr()
-	m.SaveValue("ptr", ptr)
+func (c *Credentials) StateTypeName() string {
+	return "pkg/sentry/kernel/auth.Credentials"
 }
 
-func (x *AtomicPtrCredentials) afterLoad() {}
-func (x *AtomicPtrCredentials) load(m state.Map) {
-	m.LoadValue("ptr", new(*Credentials), func(y interface{}) { x.loadPtr(y.(*Credentials)) })
+func (c *Credentials) StateFields() []string {
+	return []string{
+		"RealKUID",
+		"EffectiveKUID",
+		"SavedKUID",
+		"RealKGID",
+		"EffectiveKGID",
+		"SavedKGID",
+		"ExtraKGIDs",
+		"PermittedCaps",
+		"InheritableCaps",
+		"EffectiveCaps",
+		"BoundingCaps",
+		"KeepCaps",
+		"UserNamespace",
+	}
 }
 
-func (x *Credentials) beforeSave() {}
-func (x *Credentials) save(m state.Map) {
-	x.beforeSave()
-	m.Save("RealKUID", &x.RealKUID)
-	m.Save("EffectiveKUID", &x.EffectiveKUID)
-	m.Save("SavedKUID", &x.SavedKUID)
-	m.Save("RealKGID", &x.RealKGID)
-	m.Save("EffectiveKGID", &x.EffectiveKGID)
-	m.Save("SavedKGID", &x.SavedKGID)
-	m.Save("ExtraKGIDs", &x.ExtraKGIDs)
-	m.Save("PermittedCaps", &x.PermittedCaps)
-	m.Save("InheritableCaps", &x.InheritableCaps)
-	m.Save("EffectiveCaps", &x.EffectiveCaps)
-	m.Save("BoundingCaps", &x.BoundingCaps)
-	m.Save("KeepCaps", &x.KeepCaps)
-	m.Save("UserNamespace", &x.UserNamespace)
+func (c *Credentials) beforeSave() {}
+
+// +checklocksignore
+func (c *Credentials) StateSave(stateSinkObject state.Sink) {
+	c.beforeSave()
+	stateSinkObject.Save(0, &c.RealKUID)
+	stateSinkObject.Save(1, &c.EffectiveKUID)
+	stateSinkObject.Save(2, &c.SavedKUID)
+	stateSinkObject.Save(3, &c.RealKGID)
+	stateSinkObject.Save(4, &c.EffectiveKGID)
+	stateSinkObject.Save(5, &c.SavedKGID)
+	stateSinkObject.Save(6, &c.ExtraKGIDs)
+	stateSinkObject.Save(7, &c.PermittedCaps)
+	stateSinkObject.Save(8, &c.InheritableCaps)
+	stateSinkObject.Save(9, &c.EffectiveCaps)
+	stateSinkObject.Save(10, &c.BoundingCaps)
+	stateSinkObject.Save(11, &c.KeepCaps)
+	stateSinkObject.Save(12, &c.UserNamespace)
 }
 
-func (x *Credentials) afterLoad() {}
-func (x *Credentials) load(m state.Map) {
-	m.Load("RealKUID", &x.RealKUID)
-	m.Load("EffectiveKUID", &x.EffectiveKUID)
-	m.Load("SavedKUID", &x.SavedKUID)
-	m.Load("RealKGID", &x.RealKGID)
-	m.Load("EffectiveKGID", &x.EffectiveKGID)
-	m.Load("SavedKGID", &x.SavedKGID)
-	m.Load("ExtraKGIDs", &x.ExtraKGIDs)
-	m.Load("PermittedCaps", &x.PermittedCaps)
-	m.Load("InheritableCaps", &x.InheritableCaps)
-	m.Load("EffectiveCaps", &x.EffectiveCaps)
-	m.Load("BoundingCaps", &x.BoundingCaps)
-	m.Load("KeepCaps", &x.KeepCaps)
-	m.Load("UserNamespace", &x.UserNamespace)
+func (c *Credentials) afterLoad() {}
+
+// +checklocksignore
+func (c *Credentials) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &c.RealKUID)
+	stateSourceObject.Load(1, &c.EffectiveKUID)
+	stateSourceObject.Load(2, &c.SavedKUID)
+	stateSourceObject.Load(3, &c.RealKGID)
+	stateSourceObject.Load(4, &c.EffectiveKGID)
+	stateSourceObject.Load(5, &c.SavedKGID)
+	stateSourceObject.Load(6, &c.ExtraKGIDs)
+	stateSourceObject.Load(7, &c.PermittedCaps)
+	stateSourceObject.Load(8, &c.InheritableCaps)
+	stateSourceObject.Load(9, &c.EffectiveCaps)
+	stateSourceObject.Load(10, &c.BoundingCaps)
+	stateSourceObject.Load(11, &c.KeepCaps)
+	stateSourceObject.Load(12, &c.UserNamespace)
 }
 
-func (x *IDMapEntry) beforeSave() {}
-func (x *IDMapEntry) save(m state.Map) {
-	x.beforeSave()
-	m.Save("FirstID", &x.FirstID)
-	m.Save("FirstParentID", &x.FirstParentID)
-	m.Save("Length", &x.Length)
+func (i *IDMapEntry) StateTypeName() string {
+	return "pkg/sentry/kernel/auth.IDMapEntry"
 }
 
-func (x *IDMapEntry) afterLoad() {}
-func (x *IDMapEntry) load(m state.Map) {
-	m.Load("FirstID", &x.FirstID)
-	m.Load("FirstParentID", &x.FirstParentID)
-	m.Load("Length", &x.Length)
+func (i *IDMapEntry) StateFields() []string {
+	return []string{
+		"FirstID",
+		"FirstParentID",
+		"Length",
+	}
 }
 
-func (x *idMapRange) beforeSave() {}
-func (x *idMapRange) save(m state.Map) {
-	x.beforeSave()
-	m.Save("Start", &x.Start)
-	m.Save("End", &x.End)
+func (i *IDMapEntry) beforeSave() {}
+
+// +checklocksignore
+func (i *IDMapEntry) StateSave(stateSinkObject state.Sink) {
+	i.beforeSave()
+	stateSinkObject.Save(0, &i.FirstID)
+	stateSinkObject.Save(1, &i.FirstParentID)
+	stateSinkObject.Save(2, &i.Length)
 }
 
-func (x *idMapRange) afterLoad() {}
-func (x *idMapRange) load(m state.Map) {
-	m.Load("Start", &x.Start)
-	m.Load("End", &x.End)
+func (i *IDMapEntry) afterLoad() {}
+
+// +checklocksignore
+func (i *IDMapEntry) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &i.FirstID)
+	stateSourceObject.Load(1, &i.FirstParentID)
+	stateSourceObject.Load(2, &i.Length)
 }
 
-func (x *idMapSet) beforeSave() {}
-func (x *idMapSet) save(m state.Map) {
-	x.beforeSave()
-	var root *idMapSegmentDataSlices = x.saveRoot()
-	m.SaveValue("root", root)
+func (r *idMapRange) StateTypeName() string {
+	return "pkg/sentry/kernel/auth.idMapRange"
 }
 
-func (x *idMapSet) afterLoad() {}
-func (x *idMapSet) load(m state.Map) {
-	m.LoadValue("root", new(*idMapSegmentDataSlices), func(y interface{}) { x.loadRoot(y.(*idMapSegmentDataSlices)) })
+func (r *idMapRange) StateFields() []string {
+	return []string{
+		"Start",
+		"End",
+	}
 }
 
-func (x *idMapnode) beforeSave() {}
-func (x *idMapnode) save(m state.Map) {
-	x.beforeSave()
-	m.Save("nrSegments", &x.nrSegments)
-	m.Save("parent", &x.parent)
-	m.Save("parentIndex", &x.parentIndex)
-	m.Save("hasChildren", &x.hasChildren)
-	m.Save("keys", &x.keys)
-	m.Save("values", &x.values)
-	m.Save("children", &x.children)
+func (r *idMapRange) beforeSave() {}
+
+// +checklocksignore
+func (r *idMapRange) StateSave(stateSinkObject state.Sink) {
+	r.beforeSave()
+	stateSinkObject.Save(0, &r.Start)
+	stateSinkObject.Save(1, &r.End)
 }
 
-func (x *idMapnode) afterLoad() {}
-func (x *idMapnode) load(m state.Map) {
-	m.Load("nrSegments", &x.nrSegments)
-	m.Load("parent", &x.parent)
-	m.Load("parentIndex", &x.parentIndex)
-	m.Load("hasChildren", &x.hasChildren)
-	m.Load("keys", &x.keys)
-	m.Load("values", &x.values)
-	m.Load("children", &x.children)
+func (r *idMapRange) afterLoad() {}
+
+// +checklocksignore
+func (r *idMapRange) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &r.Start)
+	stateSourceObject.Load(1, &r.End)
 }
 
-func (x *idMapSegmentDataSlices) beforeSave() {}
-func (x *idMapSegmentDataSlices) save(m state.Map) {
-	x.beforeSave()
-	m.Save("Start", &x.Start)
-	m.Save("End", &x.End)
-	m.Save("Values", &x.Values)
+func (s *idMapSet) StateTypeName() string {
+	return "pkg/sentry/kernel/auth.idMapSet"
 }
 
-func (x *idMapSegmentDataSlices) afterLoad() {}
-func (x *idMapSegmentDataSlices) load(m state.Map) {
-	m.Load("Start", &x.Start)
-	m.Load("End", &x.End)
-	m.Load("Values", &x.Values)
+func (s *idMapSet) StateFields() []string {
+	return []string{
+		"root",
+	}
 }
 
-func (x *UserNamespace) beforeSave() {}
-func (x *UserNamespace) save(m state.Map) {
-	x.beforeSave()
-	m.Save("parent", &x.parent)
-	m.Save("owner", &x.owner)
-	m.Save("uidMapFromParent", &x.uidMapFromParent)
-	m.Save("uidMapToParent", &x.uidMapToParent)
-	m.Save("gidMapFromParent", &x.gidMapFromParent)
-	m.Save("gidMapToParent", &x.gidMapToParent)
+func (s *idMapSet) beforeSave() {}
+
+// +checklocksignore
+func (s *idMapSet) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	var rootValue *idMapSegmentDataSlices
+	rootValue = s.saveRoot()
+	stateSinkObject.SaveValue(0, rootValue)
 }
 
-func (x *UserNamespace) afterLoad() {}
-func (x *UserNamespace) load(m state.Map) {
-	m.Load("parent", &x.parent)
-	m.Load("owner", &x.owner)
-	m.Load("uidMapFromParent", &x.uidMapFromParent)
-	m.Load("uidMapToParent", &x.uidMapToParent)
-	m.Load("gidMapFromParent", &x.gidMapFromParent)
-	m.Load("gidMapToParent", &x.gidMapToParent)
+func (s *idMapSet) afterLoad() {}
+
+// +checklocksignore
+func (s *idMapSet) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.LoadValue(0, new(*idMapSegmentDataSlices), func(y any) { s.loadRoot(y.(*idMapSegmentDataSlices)) })
+}
+
+func (n *idMapnode) StateTypeName() string {
+	return "pkg/sentry/kernel/auth.idMapnode"
+}
+
+func (n *idMapnode) StateFields() []string {
+	return []string{
+		"nrSegments",
+		"parent",
+		"parentIndex",
+		"hasChildren",
+		"maxGap",
+		"keys",
+		"values",
+		"children",
+	}
+}
+
+func (n *idMapnode) beforeSave() {}
+
+// +checklocksignore
+func (n *idMapnode) StateSave(stateSinkObject state.Sink) {
+	n.beforeSave()
+	stateSinkObject.Save(0, &n.nrSegments)
+	stateSinkObject.Save(1, &n.parent)
+	stateSinkObject.Save(2, &n.parentIndex)
+	stateSinkObject.Save(3, &n.hasChildren)
+	stateSinkObject.Save(4, &n.maxGap)
+	stateSinkObject.Save(5, &n.keys)
+	stateSinkObject.Save(6, &n.values)
+	stateSinkObject.Save(7, &n.children)
+}
+
+func (n *idMapnode) afterLoad() {}
+
+// +checklocksignore
+func (n *idMapnode) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &n.nrSegments)
+	stateSourceObject.Load(1, &n.parent)
+	stateSourceObject.Load(2, &n.parentIndex)
+	stateSourceObject.Load(3, &n.hasChildren)
+	stateSourceObject.Load(4, &n.maxGap)
+	stateSourceObject.Load(5, &n.keys)
+	stateSourceObject.Load(6, &n.values)
+	stateSourceObject.Load(7, &n.children)
+}
+
+func (i *idMapSegmentDataSlices) StateTypeName() string {
+	return "pkg/sentry/kernel/auth.idMapSegmentDataSlices"
+}
+
+func (i *idMapSegmentDataSlices) StateFields() []string {
+	return []string{
+		"Start",
+		"End",
+		"Values",
+	}
+}
+
+func (i *idMapSegmentDataSlices) beforeSave() {}
+
+// +checklocksignore
+func (i *idMapSegmentDataSlices) StateSave(stateSinkObject state.Sink) {
+	i.beforeSave()
+	stateSinkObject.Save(0, &i.Start)
+	stateSinkObject.Save(1, &i.End)
+	stateSinkObject.Save(2, &i.Values)
+}
+
+func (i *idMapSegmentDataSlices) afterLoad() {}
+
+// +checklocksignore
+func (i *idMapSegmentDataSlices) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &i.Start)
+	stateSourceObject.Load(1, &i.End)
+	stateSourceObject.Load(2, &i.Values)
+}
+
+func (ns *UserNamespace) StateTypeName() string {
+	return "pkg/sentry/kernel/auth.UserNamespace"
+}
+
+func (ns *UserNamespace) StateFields() []string {
+	return []string{
+		"parent",
+		"owner",
+		"uidMapFromParent",
+		"uidMapToParent",
+		"gidMapFromParent",
+		"gidMapToParent",
+	}
+}
+
+func (ns *UserNamespace) beforeSave() {}
+
+// +checklocksignore
+func (ns *UserNamespace) StateSave(stateSinkObject state.Sink) {
+	ns.beforeSave()
+	stateSinkObject.Save(0, &ns.parent)
+	stateSinkObject.Save(1, &ns.owner)
+	stateSinkObject.Save(2, &ns.uidMapFromParent)
+	stateSinkObject.Save(3, &ns.uidMapToParent)
+	stateSinkObject.Save(4, &ns.gidMapFromParent)
+	stateSinkObject.Save(5, &ns.gidMapToParent)
+}
+
+func (ns *UserNamespace) afterLoad() {}
+
+// +checklocksignore
+func (ns *UserNamespace) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &ns.parent)
+	stateSourceObject.Load(1, &ns.owner)
+	stateSourceObject.Load(2, &ns.uidMapFromParent)
+	stateSourceObject.Load(3, &ns.uidMapToParent)
+	stateSourceObject.Load(4, &ns.gidMapFromParent)
+	stateSourceObject.Load(5, &ns.gidMapToParent)
 }
 
 func init() {
-	state.Register("auth.AtomicPtrCredentials", (*AtomicPtrCredentials)(nil), state.Fns{Save: (*AtomicPtrCredentials).save, Load: (*AtomicPtrCredentials).load})
-	state.Register("auth.Credentials", (*Credentials)(nil), state.Fns{Save: (*Credentials).save, Load: (*Credentials).load})
-	state.Register("auth.IDMapEntry", (*IDMapEntry)(nil), state.Fns{Save: (*IDMapEntry).save, Load: (*IDMapEntry).load})
-	state.Register("auth.idMapRange", (*idMapRange)(nil), state.Fns{Save: (*idMapRange).save, Load: (*idMapRange).load})
-	state.Register("auth.idMapSet", (*idMapSet)(nil), state.Fns{Save: (*idMapSet).save, Load: (*idMapSet).load})
-	state.Register("auth.idMapnode", (*idMapnode)(nil), state.Fns{Save: (*idMapnode).save, Load: (*idMapnode).load})
-	state.Register("auth.idMapSegmentDataSlices", (*idMapSegmentDataSlices)(nil), state.Fns{Save: (*idMapSegmentDataSlices).save, Load: (*idMapSegmentDataSlices).load})
-	state.Register("auth.UserNamespace", (*UserNamespace)(nil), state.Fns{Save: (*UserNamespace).save, Load: (*UserNamespace).load})
+	state.Register((*Credentials)(nil))
+	state.Register((*IDMapEntry)(nil))
+	state.Register((*idMapRange)(nil))
+	state.Register((*idMapSet)(nil))
+	state.Register((*idMapnode)(nil))
+	state.Register((*idMapSegmentDataSlices)(nil))
+	state.Register((*UserNamespace)(nil))
 }

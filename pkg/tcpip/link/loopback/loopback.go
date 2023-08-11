@@ -21,12 +21,16 @@
 package loopback
 
 import (
+	"sync"
+
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 type endpoint struct {
+	mu sync.RWMutex
+	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
 }
 
@@ -39,11 +43,15 @@ func New() stack.LinkEndpoint {
 // Attach implements stack.LinkEndpoint.Attach. It just saves the stack network-
 // layer dispatcher for later use when packets need to be dispatched.
 func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.dispatcher = dispatcher
 }
 
 // IsAttached implements stack.LinkEndpoint.IsAttached.
 func (e *endpoint) IsAttached() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.dispatcher != nil
 }
 
@@ -70,18 +78,37 @@ func (*endpoint) LinkAddress() tcpip.LinkAddress {
 	return ""
 }
 
-// WritePacket implements stack.LinkEndpoint.WritePacket. It delivers outbound
-// packets to the network-layer dispatcher.
-func (e *endpoint) WritePacket(_ *stack.Route, _ *stack.GSO, hdr buffer.Prependable, payload buffer.VectorisedView, protocol tcpip.NetworkProtocolNumber) *tcpip.Error {
-	views := make([]buffer.View, 1, 1+len(payload.Views()))
-	views[0] = hdr.View()
-	views = append(views, payload.Views()...)
-	vv := buffer.NewVectorisedView(len(views[0])+payload.Size(), views)
+// Wait implements stack.LinkEndpoint.Wait.
+func (*endpoint) Wait() {}
 
-	// Because we're immediately turning around and writing the packet back to the
-	// rx path, we intentionally don't preserve the remote and local link
-	// addresses from the stack.Route we're passed.
-	e.dispatcher.DeliverNetworkPacket(e, "" /* remote */, "" /* local */, protocol, vv)
-
-	return nil
+// WritePackets implements stack.LinkEndpoint.WritePackets. If the endpoint is
+// not attached, the packets are not delivered.
+func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+	e.mu.RLock()
+	d := e.dispatcher
+	e.mu.RUnlock()
+	for _, pkt := range pkts.AsSlice() {
+		// In order to properly loop back to the inbound side we must create a
+		// fresh packet that only contains the underlying payload with no headers
+		// or struct fields set.
+		newPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+			Payload: pkt.ToBuffer(),
+		})
+		if d != nil {
+			d.DeliverNetworkPacket(pkt.NetworkProtocolNumber, newPkt)
+		}
+		newPkt.DecRef()
+	}
+	return pkts.Len(), nil
 }
+
+// ARPHardwareType implements stack.LinkEndpoint.ARPHardwareType.
+func (*endpoint) ARPHardwareType() header.ARPHardwareType {
+	return header.ARPHardwareLoopback
+}
+
+// AddHeader implements stack.LinkEndpoint.
+func (*endpoint) AddHeader(stack.PacketBufferPtr) {}
+
+// ParseHeader implements stack.LinkEndpoint.
+func (*endpoint) ParseHeader(stack.PacketBufferPtr) bool { return true }

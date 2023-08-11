@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package seccomp provides basic seccomp filters for x86_64 (little endian).
+// Package seccomp provides generation of basic seccomp filters. Currently,
+// only little endian systems are supported.
 package seccomp
 
 import (
@@ -33,40 +34,52 @@ const (
 	defaultLabel = "default_action"
 )
 
+// NonNegativeFDCheck ensures an FD argument is a non-negative int.
+func NonNegativeFDCheck() LessThanOrEqual {
+	// Negative int32 has the MSB (31st bit) set. So the raw uint FD value must
+	// be less than or equal to 0x7fffffff.
+	return LessThanOrEqual(0x7fffffff)
+}
+
 // Install generates BPF code based on the set of syscalls provided. It only
 // allows syscalls that conform to the specification. Syscalls that violate the
-// specification will trigger RET_KILL_PROCESS, except for the cases below.
+// specification will trigger RET_KILL_PROCESS. If RET_KILL_PROCESS is not
+// supported, violations will trigger RET_TRAP instead. RET_KILL_THREAD is not
+// used because it only kills the offending thread and often keeps the sentry
+// hanging.
 //
-// RET_TRAP is used in violations, instead of RET_KILL_PROCESS, in the
-// following cases:
-//	 1. Kernel doesn't support RET_KILL_PROCESS: RET_KILL_THREAD only kills the
-//      offending thread and often keeps the sentry hanging.
-//   2. Debug: RET_TRAP generates a panic followed by a stack trace which is
-//      much easier to debug then RET_KILL_PROCESS which can't be caught.
+// denyRules describes forbidden syscalls. rules describes allowed syscalls.
+// denyRules is executed before rules.
 //
 // Be aware that RET_TRAP sends SIGSYS to the process and it may be ignored,
 // making it possible for the process to continue running after a violation.
 // However, it will leave a SECCOMP audit event trail behind. In any case, the
 // syscall is still blocked from executing.
-func Install(rules SyscallRules) error {
+func Install(rules SyscallRules, denyRules SyscallRules) error {
 	defaultAction, err := defaultAction()
 	if err != nil {
 		return err
 	}
 
-	// Uncomment to get stack trace when there is a violation.
+	// ***   DEBUG TIP   ***
+	// If you suspect the process is getting killed due to a seccomp violation, uncomment the line
+	// below to get a panic stack trace when there is a violation.
 	// defaultAction = linux.BPFAction(linux.SECCOMP_RET_TRAP)
 
 	log.Infof("Installing seccomp filters for %d syscalls (action=%v)", len(rules), defaultAction)
 
 	instrs, err := BuildProgram([]RuleSet{
-		RuleSet{
+		{
+			Rules:  denyRules,
+			Action: defaultAction,
+		},
+		{
 			Rules:  rules,
 			Action: linux.SECCOMP_RET_ALLOW,
 		},
-	}, defaultAction)
+	}, defaultAction, defaultAction)
 	if log.IsLogging(log.Debug) {
-		programStr, errDecode := bpf.DecodeProgram(instrs)
+		programStr, errDecode := bpf.DecodeInstructions(instrs)
 		if errDecode != nil {
 			programStr = fmt.Sprintf("Error: %v\n%s", errDecode, programStr)
 		}
@@ -77,8 +90,8 @@ func Install(rules SyscallRules) error {
 	}
 
 	// Perform the actual installation.
-	if errno := SetFilter(instrs); errno != 0 {
-		return fmt.Errorf("Failed to set filter: %v", errno)
+	if err := SetFilter(instrs); err != nil {
+		return fmt.Errorf("failed to set filter: %v", err)
 	}
 
 	log.Infof("Seccomp filters installed.")
@@ -117,7 +130,7 @@ var SyscallName = func(sysno uintptr) string {
 
 // BuildProgram builds a BPF program from the given map of actions to matching
 // SyscallRules. The single generated program covers all provided RuleSets.
-func BuildProgram(rules []RuleSet, defaultAction linux.BPFAction) ([]linux.BPFInstruction, error) {
+func BuildProgram(rules []RuleSet, defaultAction, badArchAction linux.BPFAction) ([]linux.BPFInstruction, error) {
 	program := bpf.NewProgramBuilder()
 
 	// Be paranoid and check that syscall is done in the expected architecture.
@@ -128,7 +141,7 @@ func BuildProgram(rules []RuleSet, defaultAction linux.BPFAction) ([]linux.BPFIn
 	// defaultLabel is at the bottom of the program. The size of program
 	// may exceeds 255 lines, which is the limit of a condition jump.
 	program.AddJump(bpf.Jmp|bpf.Jeq|bpf.K, LINUX_AUDIT_ARCH, skipOneInst, 0)
-	program.AddDirectJumpLabel(defaultLabel)
+	program.AddStmt(bpf.Ret|bpf.K, uint32(badArchAction))
 	if err := buildIndex(rules, program); err != nil {
 		return nil, err
 	}
@@ -144,6 +157,11 @@ func BuildProgram(rules []RuleSet, defaultAction linux.BPFAction) ([]linux.BPFIn
 
 // buildIndex builds a BST to quickly search through all syscalls.
 func buildIndex(rules []RuleSet, program *bpf.ProgramBuilder) error {
+	// Do nothing if rules is empty.
+	if len(rules) == 0 {
+		return nil
+	}
+
 	// Build a list of all application system calls, across all given rule
 	// sets. We have a simple BST, but may dispatch individual matchers
 	// with different actions. The matchers are evaluated linearly.
@@ -154,7 +172,7 @@ func buildIndex(rules []RuleSet, program *bpf.ProgramBuilder) error {
 		}
 	}
 	syscalls := make([]uintptr, 0, len(requiredSyscalls))
-	for sysno, _ := range requiredSyscalls {
+	for sysno := range requiredSyscalls {
 		syscalls = append(syscalls, sysno)
 	}
 	sort.Slice(syscalls, func(i, j int) bool { return syscalls[i] < syscalls[j] })
@@ -199,6 +217,10 @@ func ruleViolationLabel(ruleSetIdx int, sysno uintptr, idx int) string {
 	return fmt.Sprintf("ruleViolation_%v_%v_%v", ruleSetIdx, sysno, idx)
 }
 
+func ruleLabel(ruleSetIdx int, sysno uintptr, idx int, name string) string {
+	return fmt.Sprintf("rule_%v_%v_%v_%v", ruleSetIdx, sysno, idx, name)
+}
+
 func checkArgsLabel(sysno uintptr) string {
 	return fmt.Sprintf("checkArgs_%v", sysno)
 }
@@ -212,15 +234,161 @@ func addSyscallArgsCheck(p *bpf.ProgramBuilder, rules []Rule, action linux.BPFAc
 		labelled := false
 		for i, arg := range rule {
 			if arg != nil {
+				// Break out early if using MatchAny since no further
+				// instructions are required.
+				if _, ok := arg.(MatchAny); ok {
+					continue
+				}
+
+				// Determine the data offset for low and high bits of input.
+				dataOffsetLow := seccompDataOffsetArgLow(i)
+				dataOffsetHigh := seccompDataOffsetArgHigh(i)
+				if i == RuleIP {
+					dataOffsetLow = seccompDataOffsetIPLow
+					dataOffsetHigh = seccompDataOffsetIPHigh
+				}
+
+				// Add the conditional operation. Input values to the BPF
+				// program are 64bit values.  However, comparisons in BPF can
+				// only be done on 32bit values. This means that we need to do
+				// multiple BPF comparisons in order to do one logical 64bit
+				// comparison.
 				switch a := arg.(type) {
-				case AllowAny:
-				case AllowValue:
+				case EqualTo:
+					// EqualTo checks that both the higher and lower 32bits are equal.
 					high, low := uint32(a>>32), uint32(a)
-					// assert arg_low == low
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, seccompDataOffsetArgLow(i))
+
+					// Assert that the lower 32bits are equal.
+					// arg_low == low ? continue : violation
+					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetLow)
 					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, low, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
-					// assert arg_high == high
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, seccompDataOffsetArgHigh(i))
+
+					// Assert that the lower 32bits are also equal.
+					// arg_high == high ? continue/success : violation
+					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetHigh)
+					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, high, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
+					labelled = true
+				case NotEqual:
+					// NotEqual checks that either the higher or lower 32bits
+					// are *not* equal.
+					high, low := uint32(a>>32), uint32(a)
+					labelGood := fmt.Sprintf("ne%v", i)
+
+					// Check if the higher 32bits are (not) equal.
+					// arg_low == low ? continue : success
+					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetLow)
+					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, low, 0, ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
+
+					// Assert that the lower 32bits are not equal (assuming
+					// higher bits are equal).
+					// arg_high == high ? violation : continue/success
+					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetHigh)
+					p.AddJumpTrueLabel(bpf.Jmp|bpf.Jeq|bpf.K, high, ruleViolationLabel(ruleSetIdx, sysno, ruleidx), 0)
+					p.AddLabel(ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
+					labelled = true
+				case GreaterThan:
+					// GreaterThan checks that the higher 32bits is greater
+					// *or* that the higher 32bits are equal and the lower
+					// 32bits are greater.
+					high, low := uint32(a>>32), uint32(a)
+					labelGood := fmt.Sprintf("gt%v", i)
+
+					// Assert the higher 32bits are greater than or equal.
+					// arg_high >= high ? continue : violation (arg_high < high)
+					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetHigh)
+					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jge|bpf.K, high, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
+
+					// Assert that the lower 32bits are greater.
+					// arg_high == high ? continue : success (arg_high > high)
+					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, high, 0, ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
+					// arg_low > low ? continue/success : violation (arg_high == high and arg_low <= low)
+					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetLow)
+					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jgt|bpf.K, low, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
+					p.AddLabel(ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
+					labelled = true
+				case GreaterThanOrEqual:
+					// GreaterThanOrEqual checks that the higher 32bits is
+					// greater *or* that the higher 32bits are equal and the
+					// lower 32bits are greater than or equal.
+					high, low := uint32(a>>32), uint32(a)
+					labelGood := fmt.Sprintf("ge%v", i)
+
+					// Assert the higher 32bits are greater than or equal.
+					// arg_high >= high ? continue : violation (arg_high < high)
+					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetHigh)
+					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jge|bpf.K, high, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
+					// arg_high == high ? continue : success (arg_high > high)
+					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, high, 0, ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
+
+					// Assert that the lower 32bits are greater (assuming the
+					// higher bits are equal).
+					// arg_low >= low ? continue/success : violation (arg_high == high and arg_low < low)
+					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetLow)
+					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jge|bpf.K, low, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
+					p.AddLabel(ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
+					labelled = true
+				case LessThan:
+					// LessThan checks that the higher 32bits is less *or* that
+					// the higher 32bits are equal and the lower 32bits are
+					// less.
+					high, low := uint32(a>>32), uint32(a)
+					labelGood := fmt.Sprintf("lt%v", i)
+
+					// Assert the higher 32bits are less than or equal.
+					// arg_high > high ? violation : continue
+					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetHigh)
+					p.AddJumpTrueLabel(bpf.Jmp|bpf.Jgt|bpf.K, high, ruleViolationLabel(ruleSetIdx, sysno, ruleidx), 0)
+					// arg_high == high ? continue : success (arg_high < high)
+					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, high, 0, ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
+
+					// Assert that the lower 32bits are less (assuming the
+					// higher bits are equal).
+					// arg_low >= low ? violation : continue
+					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetLow)
+					p.AddJumpTrueLabel(bpf.Jmp|bpf.Jge|bpf.K, low, ruleViolationLabel(ruleSetIdx, sysno, ruleidx), 0)
+					p.AddLabel(ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
+					labelled = true
+				case LessThanOrEqual:
+					// LessThan checks that the higher 32bits is less *or* that
+					// the higher 32bits are equal and the lower 32bits are
+					// less than or equal.
+					high, low := uint32(a>>32), uint32(a)
+					labelGood := fmt.Sprintf("le%v", i)
+
+					// Assert the higher 32bits are less than or equal.
+					// assert arg_high > high ? violation : continue
+					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetHigh)
+					p.AddJumpTrueLabel(bpf.Jmp|bpf.Jgt|bpf.K, high, ruleViolationLabel(ruleSetIdx, sysno, ruleidx), 0)
+					// arg_high == high ? continue : success
+					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, high, 0, ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
+
+					// Assert the lower bits are less than or equal (assuming
+					// the higher bits are equal).
+					// arg_low > low ? violation : success
+					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetLow)
+					p.AddJumpTrueLabel(bpf.Jmp|bpf.Jgt|bpf.K, low, ruleViolationLabel(ruleSetIdx, sysno, ruleidx), 0)
+					p.AddLabel(ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
+					labelled = true
+				case maskedEqual:
+					// MaskedEqual checks that the bitwise AND of the value and
+					// mask are equal for both the higher and lower 32bits.
+					high, low := uint32(a.value>>32), uint32(a.value)
+					maskHigh, maskLow := uint32(a.mask>>32), uint32(a.mask)
+
+					// Assert that the lower 32bits are equal when masked.
+					// A <- arg_low.
+					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetLow)
+					// A <- arg_low & maskLow
+					p.AddStmt(bpf.Alu|bpf.And|bpf.K, maskLow)
+					// Assert that arg_low & maskLow == low.
+					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, low, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
+
+					// Assert that the higher 32bits are equal when masked.
+					// A <- arg_high
+					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetHigh)
+					// A <- arg_high & maskHigh
+					p.AddStmt(bpf.Alu|bpf.And|bpf.K, maskHigh)
+					// Assert that arg_high & maskHigh == high.
 					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, high, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
 					labelled = true
 				default:
@@ -248,19 +416,22 @@ func addSyscallArgsCheck(p *bpf.ProgramBuilder, rules []Rule, action linux.BPFAc
 // is as follows:
 //
 // // SYS_PIPE(22), root
-//   (A == 22) ? goto argument check : continue
-//   (A > 22) ? goto index_35 : goto index_9
+//
+//	(A == 22) ? goto argument check : continue
+//	(A > 22) ? goto index_35 : goto index_9
 //
 // index_9:  // SYS_MMAP(9), leaf
-//   A == 9) ? goto argument check : defaultLabel
+//
+//	A == 9) ? goto argument check : defaultLabel
 //
 // index_35:  // SYS_NANOSLEEP(35), single child
-//   (A == 35) ? goto argument check : continue
-//   (A > 35) ? goto index_50 : goto defaultLabel
+//
+//	(A == 35) ? goto argument check : continue
+//	(A > 35) ? goto index_50 : goto defaultLabel
 //
 // index_50:  // SYS_LISTEN(50), leaf
-//   (A == 50) ? goto argument check : goto defaultLabel
 //
+//	(A == 50) ? goto argument check : goto defaultLabel
 func buildBSTProgram(n *node, rules []RuleSet, program *bpf.ProgramBuilder) error {
 	// Root node is never referenced by label, skip it.
 	if !n.root {

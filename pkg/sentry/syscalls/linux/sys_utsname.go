@@ -12,19 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build amd64
-
 package linux
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 // Uname implements linux syscall uname.
-func Uname(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Uname(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	version := t.SyscallTable().Version
 
 	uts := t.UTSNamespace()
@@ -35,26 +33,34 @@ func Uname(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	copy(u.Nodename[:], uts.HostName())
 	copy(u.Release[:], version.Release)
 	copy(u.Version[:], version.Version)
-	copy(u.Machine[:], "x86_64") // build tag above.
+	// build tag above.
+	switch t.SyscallTable().Arch {
+	case arch.AMD64:
+		copy(u.Machine[:], "x86_64")
+	case arch.ARM64:
+		copy(u.Machine[:], "aarch64")
+	default:
+		copy(u.Machine[:], "unknown")
+	}
 	copy(u.Domainname[:], uts.DomainName())
 
 	// Copy out the result.
 	va := args[0].Pointer()
-	_, err := t.CopyOut(va, u)
+	_, err := u.CopyOut(t, va)
 	return 0, nil, err
 }
 
 // Setdomainname implements Linux syscall setdomainname.
-func Setdomainname(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Setdomainname(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	nameAddr := args[0].Pointer()
 	size := args[1].Int()
 
 	utsns := t.UTSNamespace()
 	if !t.HasCapabilityIn(linux.CAP_SYS_ADMIN, utsns.UserNamespace()) {
-		return 0, nil, syserror.EPERM
+		return 0, nil, linuxerr.EPERM
 	}
 	if size < 0 || size > linux.UTSLen {
-		return 0, nil, syserror.EINVAL
+		return 0, nil, linuxerr.EINVAL
 	}
 
 	name, err := t.CopyInString(nameAddr, int(size))
@@ -67,23 +73,23 @@ func Setdomainname(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel
 }
 
 // Sethostname implements Linux syscall sethostname.
-func Sethostname(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Sethostname(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	nameAddr := args[0].Pointer()
 	size := args[1].Int()
 
 	utsns := t.UTSNamespace()
 	if !t.HasCapabilityIn(linux.CAP_SYS_ADMIN, utsns.UserNamespace()) {
-		return 0, nil, syserror.EPERM
+		return 0, nil, linuxerr.EPERM
 	}
 	if size < 0 || size > linux.UTSLen {
-		return 0, nil, syserror.EINVAL
+		return 0, nil, linuxerr.EINVAL
 	}
 
-	name, err := t.CopyInString(nameAddr, int(size))
-	if err != nil {
+	name := make([]byte, size)
+	if _, err := t.CopyInBytes(nameAddr, name); err != nil {
 		return 0, nil, err
 	}
 
-	utsns.SetHostName(name)
+	utsns.SetHostName(string(name))
 	return 0, nil, nil
 }

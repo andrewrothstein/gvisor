@@ -59,7 +59,7 @@ func AppendUint64(buf []byte, order binary.ByteOrder, num uint64) []byte {
 // data must only contain fixed-length signed and unsigned ints, arrays,
 // slices, structs and compositions of said types. data may be a pointer,
 // but cannot contain pointers.
-func Marshal(buf []byte, order binary.ByteOrder, data interface{}) []byte {
+func Marshal(buf []byte, order binary.ByteOrder, data any) []byte {
 	return marshal(buf, order, reflect.Indirect(reflect.ValueOf(data)))
 }
 
@@ -104,7 +104,7 @@ func marshal(buf []byte, order binary.ByteOrder, data reflect.Value) []byte {
 // data must be a slice or a pointer and buf must have a length of exactly
 // Size(data). data must only contain fixed-length signed and unsigned ints,
 // arrays, slices, structs and compositions of said types.
-func Unmarshal(buf []byte, order binary.ByteOrder, data interface{}) {
+func Unmarshal(buf []byte, order binary.ByteOrder, data any) {
 	value := reflect.ValueOf(data)
 	switch value.Kind() {
 	case reflect.Ptr:
@@ -170,7 +170,7 @@ func unmarshal(buf []byte, order binary.ByteOrder, data reflect.Value) []byte {
 // Size calculates the buffer sized needed by Marshal or Unmarshal.
 //
 // Size only support the types supported by Marshal.
-func Size(v interface{}) uintptr {
+func Size(v any) uintptr {
 	return sizeof(reflect.Indirect(reflect.ValueOf(v)))
 }
 
@@ -253,4 +253,14 @@ func WriteUint64(w io.Writer, order binary.ByteOrder, num uint64) error {
 	order.PutUint64(buf, num)
 	_, err := w.Write(buf)
 	return err
+}
+
+// AlignUp rounds a length up to an alignment. align must be a power of 2.
+func AlignUp(length int, align uint) int {
+	return (length + int(align) - 1) & ^(int(align) - 1)
+}
+
+// AlignDown rounds a length down to an alignment. align must be a power of 2.
+func AlignDown(length int, align uint) int {
+	return length & ^(int(align) - 1)
 }

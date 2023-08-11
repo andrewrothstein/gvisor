@@ -17,270 +17,384 @@
 package netfilter
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"math/rand"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/binary"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/iptables"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
-// errorTargetName is used to mark targets as error targets. Error targets
-// shouldn't be reached - an error has occurred if we fall through to one.
-const errorTargetName = "ERROR"
+// enableLogging controls whether to log the (de)serialization of netfilter
+// structs between userspace and netstack. These logs are useful when
+// developing iptables, but can pollute sentry logs otherwise.
+const enableLogging = false
 
-// metadata is opaque to netstack. It holds data that we need to translate
-// between Linux's and netstack's iptables representations.
-type metadata struct {
-	HookEntry  [linux.NF_INET_NUMHOOKS]uint32
-	Underflow  [linux.NF_INET_NUMHOOKS]uint32
-	NumEntries uint32
-	Size       uint32
+// nflog logs messages related to the writing and reading of iptables.
+func nflog(format string, args ...any) {
+	if enableLogging && log.IsLogging(log.Debug) {
+		log.Debugf("netfilter: "+format, args...)
+	}
+}
+
+// Table names.
+const (
+	natTable    = "nat"
+	mangleTable = "mangle"
+	filterTable = "filter"
+)
+
+// nameToID is immutable.
+var nameToID = map[string]stack.TableID{
+	natTable:    stack.NATID,
+	mangleTable: stack.MangleID,
+	filterTable: stack.FilterID,
+}
+
+// DefaultLinuxTables returns the rules of stack.DefaultTables() wrapped for
+// compatibility with netfilter extensions.
+func DefaultLinuxTables(clock tcpip.Clock, rand *rand.Rand) *stack.IPTables {
+	tables := stack.DefaultTables(clock, rand)
+	tables.VisitTargets(func(oldTarget stack.Target) stack.Target {
+		switch val := oldTarget.(type) {
+		case *stack.AcceptTarget:
+			return &acceptTarget{AcceptTarget: *val}
+		case *stack.DropTarget:
+			return &dropTarget{DropTarget: *val}
+		case *stack.ErrorTarget:
+			return &errorTarget{ErrorTarget: *val}
+		case *stack.UserChainTarget:
+			return &userChainTarget{UserChainTarget: *val}
+		case *stack.ReturnTarget:
+			return &returnTarget{ReturnTarget: *val}
+		case *stack.RedirectTarget:
+			return &redirectTarget{RedirectTarget: *val}
+		default:
+			panic(fmt.Sprintf("Unknown rule in default iptables of type %T", val))
+		}
+	})
+	return tables
 }
 
 // GetInfo returns information about iptables.
-func GetInfo(t *kernel.Task, ep tcpip.Endpoint, outPtr usermem.Addr) (linux.IPTGetinfo, *syserr.Error) {
+func GetInfo(t *kernel.Task, stack *stack.Stack, outPtr hostarch.Addr, ipv6 bool) (linux.IPTGetinfo, *syserr.Error) {
 	// Read in the struct and table name.
 	var info linux.IPTGetinfo
-	if _, err := t.CopyIn(outPtr, &info); err != nil {
+	if _, err := info.CopyIn(t, outPtr); err != nil {
 		return linux.IPTGetinfo{}, syserr.FromError(err)
 	}
 
-	// Find the appropriate table.
-	table, err := findTable(ep, info.TableName())
+	var err error
+	if ipv6 {
+		_, info, err = convertNetstackToBinary6(stack, info.Name)
+	} else {
+		_, info, err = convertNetstackToBinary4(stack, info.Name)
+	}
 	if err != nil {
-		return linux.IPTGetinfo{}, err
+		nflog("couldn't convert iptables: %v", err)
+		return linux.IPTGetinfo{}, syserr.ErrInvalidArgument
 	}
 
-	// Get the hooks that apply to this table.
-	info.ValidHooks = table.ValidHooks()
-
-	// Grab the metadata struct, which is used to store information (e.g.
-	// the number of entries) that applies to the user's encoding of
-	// iptables, but not netstack's.
-	metadata := table.Metadata().(metadata)
-
-	// Set values from metadata.
-	info.HookEntry = metadata.HookEntry
-	info.Underflow = metadata.Underflow
-	info.NumEntries = metadata.NumEntries
-	info.Size = metadata.Size
-
+	nflog("returning info: %+v", info)
 	return info, nil
 }
 
-// GetEntries returns netstack's iptables rules encoded for the iptables tool.
-func GetEntries(t *kernel.Task, ep tcpip.Endpoint, outPtr usermem.Addr, outLen int) (linux.KernelIPTGetEntries, *syserr.Error) {
+// GetEntries4 returns netstack's iptables rules.
+func GetEntries4(t *kernel.Task, stack *stack.Stack, outPtr hostarch.Addr, outLen int) (linux.KernelIPTGetEntries, *syserr.Error) {
 	// Read in the struct and table name.
 	var userEntries linux.IPTGetEntries
-	if _, err := t.CopyIn(outPtr, &userEntries); err != nil {
+	if _, err := userEntries.CopyIn(t, outPtr); err != nil {
+		nflog("couldn't copy in entries %q", userEntries.Name)
 		return linux.KernelIPTGetEntries{}, syserr.FromError(err)
-	}
-
-	// Find the appropriate table.
-	table, err := findTable(ep, userEntries.TableName())
-	if err != nil {
-		return linux.KernelIPTGetEntries{}, err
 	}
 
 	// Convert netstack's iptables rules to something that the iptables
 	// tool can understand.
-	entries, _, err := convertNetstackToBinary(userEntries.TableName(), table)
+	entries, _, err := convertNetstackToBinary4(stack, userEntries.Name)
 	if err != nil {
-		return linux.KernelIPTGetEntries{}, err
+		nflog("couldn't read entries: %v", err)
+		return linux.KernelIPTGetEntries{}, syserr.ErrInvalidArgument
 	}
-	if binary.Size(entries) > uintptr(outLen) {
+	if entries.SizeBytes() > outLen {
+		nflog("insufficient GetEntries output size: %d", uintptr(outLen))
 		return linux.KernelIPTGetEntries{}, syserr.ErrInvalidArgument
 	}
 
 	return entries, nil
 }
 
-func findTable(ep tcpip.Endpoint, tableName string) (iptables.Table, *syserr.Error) {
-	ipt, err := ep.IPTables()
+// GetEntries6 returns netstack's ip6tables rules.
+func GetEntries6(t *kernel.Task, stack *stack.Stack, outPtr hostarch.Addr, outLen int) (linux.KernelIP6TGetEntries, *syserr.Error) {
+	// Read in the struct and table name. IPv4 and IPv6 utilize structs
+	// with the same layout.
+	var userEntries linux.IPTGetEntries
+	if _, err := userEntries.CopyIn(t, outPtr); err != nil {
+		nflog("couldn't copy in entries %q", userEntries.Name)
+		return linux.KernelIP6TGetEntries{}, syserr.FromError(err)
+	}
+
+	// Convert netstack's iptables rules to something that the iptables
+	// tool can understand.
+	entries, _, err := convertNetstackToBinary6(stack, userEntries.Name)
 	if err != nil {
-		return iptables.Table{}, syserr.FromError(err)
+		nflog("couldn't read entries: %v", err)
+		return linux.KernelIP6TGetEntries{}, syserr.ErrInvalidArgument
 	}
-	table, ok := ipt.Tables[tableName]
-	if !ok {
-		return iptables.Table{}, syserr.ErrInvalidArgument
+	if entries.SizeBytes() > outLen {
+		nflog("insufficient GetEntries output size: %d", uintptr(outLen))
+		return linux.KernelIP6TGetEntries{}, syserr.ErrInvalidArgument
 	}
-	return table, nil
+
+	return entries, nil
 }
 
-// FillDefaultIPTables sets stack's IPTables to the default tables and
-// populates them with metadata.
-func FillDefaultIPTables(stack *stack.Stack) {
-	ipt := iptables.DefaultTables()
-
-	// In order to fill in the metadata, we have to translate ipt from its
-	// netstack format to Linux's giant-binary-blob format.
-	for name, table := range ipt.Tables {
-		_, metadata, err := convertNetstackToBinary(name, table)
-		if err != nil {
-			panic(fmt.Errorf("Unable to set default IP tables: %v", err))
+// setHooksAndUnderflow checks whether the rule at ruleIdx is a hook entrypoint
+// or underflow, in which case it fills in info.HookEntry and info.Underflows.
+func setHooksAndUnderflow(info *linux.IPTGetinfo, table stack.Table, offset uint32, ruleIdx int) {
+	// Is this a chain entry point?
+	for hook, hookRuleIdx := range table.BuiltinChains {
+		if hookRuleIdx == ruleIdx {
+			nflog("convert to binary: found hook %d at offset %d", hook, offset)
+			info.HookEntry[hook] = offset
 		}
-		table.SetMetadata(metadata)
-		ipt.Tables[name] = table
 	}
-
-	stack.SetIPTables(ipt)
+	// Is this a chain underflow point?
+	for underflow, underflowRuleIdx := range table.Underflows {
+		if underflowRuleIdx == ruleIdx {
+			nflog("convert to binary: found underflow %d at offset %d", underflow, offset)
+			info.Underflow[underflow] = offset
+		}
+	}
 }
 
-// convertNetstackToBinary converts the iptables as stored in netstack to the
-// format expected by the iptables tool. Linux stores each table as a binary
-// blob that can only be traversed by parsing a bit, reading some offsets,
-// jumping to those offsets, parsing again, etc.
-func convertNetstackToBinary(name string, table iptables.Table) (linux.KernelIPTGetEntries, metadata, *syserr.Error) {
-	// Return values.
-	var entries linux.KernelIPTGetEntries
-	var meta metadata
+// SetEntries sets iptables rules for a single table. See
+// net/ipv4/netfilter/ip_tables.c:translate_table for reference.
+func SetEntries(task *kernel.Task, stk *stack.Stack, optVal []byte, ipv6 bool) *syserr.Error {
+	var replace linux.IPTReplace
+	optVal = replace.UnmarshalBytes(optVal)
 
-	// The table name has to fit in the struct.
-	if linux.XT_TABLE_MAXNAMELEN < len(name) {
-		return linux.KernelIPTGetEntries{}, metadata{}, syserr.ErrInvalidArgument
+	var table stack.Table
+	switch replace.Name.String() {
+	case filterTable:
+		table = stack.EmptyFilterTable()
+	case natTable:
+		table = stack.EmptyNATTable()
+	default:
+		nflog("unknown iptables table %q", replace.Name.String())
+		return syserr.ErrInvalidArgument
 	}
-	copy(entries.Name[:], name)
 
-	// Deal with the built in chains first (INPUT, OUTPUT, etc.). Each of
-	// these chains ends with an unconditional policy entry.
-	for hook := iptables.Prerouting; hook < iptables.NumHooks; hook++ {
-		chain, ok := table.BuiltinChains[hook]
-		if !ok {
-			// This table doesn't support this hook.
+	var err *syserr.Error
+	var offsets map[uint32]int
+	if ipv6 {
+		offsets, err = modifyEntries6(task, stk, optVal, &replace, &table)
+	} else {
+		offsets, err = modifyEntries4(task, stk, optVal, &replace, &table)
+	}
+	if err != nil {
+		return err
+	}
+
+	// Go through the list of supported hooks for this table and, for each
+	// one, set the rule it corresponds to.
+	for hook := range replace.HookEntry {
+		if table.ValidHooks()&(1<<hook) != 0 {
+			hk := hookFromLinux(hook)
+			table.BuiltinChains[hk] = stack.HookUnset
+			table.Underflows[hk] = stack.HookUnset
+			for offset, ruleIdx := range offsets {
+				if offset == replace.HookEntry[hook] {
+					table.BuiltinChains[hk] = ruleIdx
+				}
+				if offset == replace.Underflow[hook] {
+					if !validUnderflow(table.Rules[ruleIdx], ipv6) {
+						nflog("underflow for hook %d isn't an unconditional ACCEPT or DROP: %+v", ruleIdx)
+						return syserr.ErrInvalidArgument
+					}
+					table.Underflows[hk] = ruleIdx
+				}
+			}
+			if ruleIdx := table.BuiltinChains[hk]; ruleIdx == stack.HookUnset {
+				nflog("hook %v is unset.", hk)
+				return syserr.ErrInvalidArgument
+			}
+			if ruleIdx := table.Underflows[hk]; ruleIdx == stack.HookUnset {
+				nflog("underflow %v is unset.", hk)
+				return syserr.ErrInvalidArgument
+			}
+		}
+	}
+
+	// Check the user chains.
+	for ruleIdx, rule := range table.Rules {
+		if _, ok := rule.Target.(*stack.UserChainTarget); !ok {
 			continue
 		}
 
-		// Sanity check.
-		if len(chain.Rules) < 1 {
-			return linux.KernelIPTGetEntries{}, metadata{}, syserr.ErrInvalidArgument
+		// We found a user chain. Before inserting it into the table,
+		// check that:
+		//	- There's some other rule after it.
+		//	- There are no matchers.
+		if ruleIdx == len(table.Rules)-1 {
+			nflog("user chain must have a rule or default policy")
+			return syserr.ErrInvalidArgument
+		}
+		if len(table.Rules[ruleIdx].Matchers) != 0 {
+			nflog("user chain's first node must have no matchers")
+			return syserr.ErrInvalidArgument
+		}
+	}
+
+	// Set each jump to point to the appropriate rule. Right now they hold byte
+	// offsets.
+	for ruleIdx, rule := range table.Rules {
+		jump, ok := rule.Target.(*JumpTarget)
+		if !ok {
+			continue
 		}
 
-		for ruleIdx, rule := range chain.Rules {
-			// If this is the first rule of a builtin chain, set
-			// the metadata hook entry point.
-			if ruleIdx == 0 {
-				meta.HookEntry[hook] = entries.Size
+		// Find the rule corresponding to the jump rule offset.
+		jumpTo, ok := offsets[jump.Offset]
+		if !ok {
+			nflog("failed to find a rule to jump to")
+			return syserr.ErrInvalidArgument
+		}
+		jump.RuleNum = jumpTo
+		rule.Target = jump
+		table.Rules[ruleIdx] = rule
+	}
+
+	// Since we don't support FORWARD, yet, make sure all other chains point to
+	// ACCEPT rules.
+	for hook, ruleIdx := range table.BuiltinChains {
+		if hook := stack.Hook(hook); hook == stack.Forward {
+			if ruleIdx == stack.HookUnset {
+				continue
 			}
-
-			// Each rule corresponds to an entry.
-			entry := linux.KernelIPTEntry{
-				IPTEntry: linux.IPTEntry{
-					NextOffset:   linux.SizeOfIPTEntry,
-					TargetOffset: linux.SizeOfIPTEntry,
-				},
+			if !isUnconditionalAccept(table.Rules[ruleIdx], ipv6) {
+				nflog("hook %d is unsupported.", hook)
+				return syserr.ErrInvalidArgument
 			}
+		}
+	}
 
-			for _, matcher := range rule.Matchers {
-				// Serialize the matcher and add it to the
-				// entry.
-				serialized := marshalMatcher(matcher)
-				entry.Elems = append(entry.Elems, serialized...)
-				entry.NextOffset += uint16(len(serialized))
-				entry.TargetOffset += uint16(len(serialized))
-			}
+	// TODO(gvisor.dev/issue/6167): Check the following conditions:
+	//	- There are no loops.
+	//	- There are no chains without an unconditional final rule.
+	//	- There are no chains without an unconditional underflow rule.
 
-			// Serialize and append the target.
-			serialized := marshalTarget(rule.Target)
-			entry.Elems = append(entry.Elems, serialized...)
-			entry.NextOffset += uint16(len(serialized))
+	stk.IPTables().ReplaceTable(nameToID[replace.Name.String()], table, ipv6)
+	return nil
+}
 
-			// The underflow rule is the last rule in the chain,
-			// and is an unconditional rule (i.e. it matches any
-			// packet). This is enforced when saving iptables.
-			if ruleIdx == len(chain.Rules)-1 {
-				meta.Underflow[hook] = entries.Size
-			}
+// parseMatchers parses 0 or more matchers from optVal. optVal should contain
+// only the matchers.
+func parseMatchers(task *kernel.Task, filter stack.IPHeaderFilter, optVal []byte) ([]stack.Matcher, error) {
+	nflog("set entries: parsing matchers of size %d", len(optVal))
+	var matchers []stack.Matcher
+	for len(optVal) > 0 {
+		nflog("set entries: optVal has len %d", len(optVal))
 
-			entries.Size += uint32(entry.NextOffset)
-			entries.Entrytable = append(entries.Entrytable, entry)
-			meta.NumEntries++
+		// Get the XTEntryMatch.
+		if len(optVal) < linux.SizeOfXTEntryMatch {
+			return nil, fmt.Errorf("optVal has insufficient size for entry match: %d", len(optVal))
+		}
+		var match linux.XTEntryMatch
+		match.UnmarshalUnsafe(optVal)
+		nflog("set entries: parsed entry match %q: %+v", match.Name.String(), match)
+
+		// Check some invariants.
+		if match.MatchSize < linux.SizeOfXTEntryMatch {
+			return nil, fmt.Errorf("match size is too small, must be at least %d", linux.SizeOfXTEntryMatch)
+		}
+		if len(optVal) < int(match.MatchSize) {
+			return nil, fmt.Errorf("optVal has insufficient size for match: %d", len(optVal))
 		}
 
+		// Parse the specific matcher.
+		matcher, err := unmarshalMatcher(task, match, filter, optVal[linux.SizeOfXTEntryMatch:match.MatchSize])
+		if err != nil {
+			return nil, fmt.Errorf("failed to create matcher: %v", err)
+		}
+		matchers = append(matchers, matcher)
+
+		// TODO(gvisor.dev/issue/6167): Check the revision field.
+		optVal = optVal[match.MatchSize:]
 	}
 
-	// TODO(gvisor.dev/issue/170): Deal with the user chains here. Each of
-	// these starts with an error node holding the chain's name and ends
-	// with an unconditional return.
-
-	// Lastly, each table ends with an unconditional error target rule as
-	// its final entry.
-	errorEntry := linux.KernelIPTEntry{
-		IPTEntry: linux.IPTEntry{
-			NextOffset:   linux.SizeOfIPTEntry,
-			TargetOffset: linux.SizeOfIPTEntry,
-		},
+	if len(optVal) != 0 {
+		return nil, errors.New("optVal should be exhausted after parsing matchers")
 	}
-	var errorTarget linux.XTErrorTarget
-	errorTarget.Target.TargetSize = linux.SizeOfXTErrorTarget
-	copy(errorTarget.ErrorName[:], errorTargetName)
-	copy(errorTarget.Target.Name[:], errorTargetName)
 
-	// Serialize and add it to the list of entries.
-	errorTargetBuf := make([]byte, 0, linux.SizeOfXTErrorTarget)
-	serializedErrorTarget := binary.Marshal(errorTargetBuf, usermem.ByteOrder, errorTarget)
-	errorEntry.Elems = append(errorEntry.Elems, serializedErrorTarget...)
-	errorEntry.NextOffset += uint16(len(serializedErrorTarget))
-
-	entries.Size += uint32(errorEntry.NextOffset)
-	entries.Entrytable = append(entries.Entrytable, errorEntry)
-	meta.NumEntries++
-	meta.Size = entries.Size
-
-	return entries, meta, nil
+	return matchers, nil
 }
 
-func marshalMatcher(matcher iptables.Matcher) []byte {
-	switch matcher.(type) {
+func validUnderflow(rule stack.Rule, ipv6 bool) bool {
+	if len(rule.Matchers) != 0 {
+		return false
+	}
+	if (ipv6 && rule.Filter != emptyIPv6Filter) || (!ipv6 && rule.Filter != emptyIPv4Filter) {
+		return false
+	}
+	switch rule.Target.(type) {
+	case *acceptTarget, *dropTarget:
+		return true
 	default:
-		// TODO(gvisor.dev/issue/170): We don't support any matchers yet, so
-		// any call to marshalMatcher will panic.
-		panic(fmt.Errorf("unknown matcher of type %T", matcher))
+		return false
 	}
 }
 
-func marshalTarget(target iptables.Target) []byte {
-	switch target.(type) {
-	case iptables.UnconditionalAcceptTarget:
-		return marshalUnconditionalAcceptTarget()
-	default:
-		panic(fmt.Errorf("unknown target of type %T", target))
+func isUnconditionalAccept(rule stack.Rule, ipv6 bool) bool {
+	if !validUnderflow(rule, ipv6) {
+		return false
 	}
+	_, ok := rule.Target.(*acceptTarget)
+	return ok
 }
 
-func marshalUnconditionalAcceptTarget() []byte {
-	// The target's name will be the empty string.
-	target := linux.XTStandardTarget{
-		Target: linux.XTEntryTarget{
-			TargetSize: linux.SizeOfXTStandardTarget,
-		},
-		Verdict: translateStandardVerdict(iptables.Accept),
+func hookFromLinux(hook int) stack.Hook {
+	switch hook {
+	case linux.NF_INET_PRE_ROUTING:
+		return stack.Prerouting
+	case linux.NF_INET_LOCAL_IN:
+		return stack.Input
+	case linux.NF_INET_FORWARD:
+		return stack.Forward
+	case linux.NF_INET_LOCAL_OUT:
+		return stack.Output
+	case linux.NF_INET_POST_ROUTING:
+		return stack.Postrouting
 	}
-
-	ret := make([]byte, 0, linux.SizeOfXTStandardTarget)
-	return binary.Marshal(ret, usermem.ByteOrder, target)
+	panic(fmt.Sprintf("Unknown hook %d does not correspond to a builtin chain", hook))
 }
 
-// translateStandardVerdict translates verdicts the same way as the iptables
-// tool.
-func translateStandardVerdict(verdict iptables.Verdict) int32 {
-	switch verdict {
-	case iptables.Accept:
-		return -linux.NF_ACCEPT - 1
-	case iptables.Drop:
-		return -linux.NF_DROP - 1
-	case iptables.Queue:
-		return -linux.NF_QUEUE - 1
-	case iptables.Return:
-		return linux.NF_RETURN
-	case iptables.Jump:
-		// TODO(gvisor.dev/issue/170): Support Jump.
-		panic("Jump isn't supported yet")
-	default:
-		panic(fmt.Sprintf("unknown standard verdict: %d", verdict))
+// TargetRevision returns a linux.XTGetRevision for a given target. It sets
+// Revision to the highest supported value, unless the provided revision number
+// is larger.
+func TargetRevision(t *kernel.Task, revPtr hostarch.Addr, netProto tcpip.NetworkProtocolNumber) (linux.XTGetRevision, *syserr.Error) {
+	// Read in the target name and version.
+	var rev linux.XTGetRevision
+	if _, err := rev.CopyIn(t, revPtr); err != nil {
+		return linux.XTGetRevision{}, syserr.FromError(err)
 	}
+	maxSupported, ok := targetRevision(rev.Name.String(), netProto, rev.Revision)
+	if !ok {
+		return linux.XTGetRevision{}, syserr.ErrProtocolNotSupported
+	}
+	rev.Revision = maxSupported
+	return rev, nil
+}
+
+func trimNullBytes(b []byte) []byte {
+	n := bytes.IndexByte(b, 0)
+	if n == -1 {
+		n = len(b)
+	}
+	return b[:n]
 }

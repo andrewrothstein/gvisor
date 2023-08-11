@@ -4,125 +4,194 @@ package udp
 
 import (
 	"gvisor.dev/gvisor/pkg/state"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 )
 
-func (x *udpPacket) beforeSave() {}
-func (x *udpPacket) save(m state.Map) {
-	x.beforeSave()
-	var data buffer.VectorisedView = x.saveData()
-	m.SaveValue("data", data)
-	m.Save("udpPacketEntry", &x.udpPacketEntry)
-	m.Save("senderAddress", &x.senderAddress)
-	m.Save("timestamp", &x.timestamp)
+func (p *udpPacket) StateTypeName() string {
+	return "pkg/tcpip/transport/udp.udpPacket"
 }
 
-func (x *udpPacket) afterLoad() {}
-func (x *udpPacket) load(m state.Map) {
-	m.Load("udpPacketEntry", &x.udpPacketEntry)
-	m.Load("senderAddress", &x.senderAddress)
-	m.Load("timestamp", &x.timestamp)
-	m.LoadValue("data", new(buffer.VectorisedView), func(y interface{}) { x.loadData(y.(buffer.VectorisedView)) })
+func (p *udpPacket) StateFields() []string {
+	return []string{
+		"udpPacketEntry",
+		"netProto",
+		"senderAddress",
+		"destinationAddress",
+		"packetInfo",
+		"pkt",
+		"receivedAt",
+		"tosOrTClass",
+		"ttlOrHopLimit",
+	}
 }
 
-func (x *endpoint) save(m state.Map) {
-	x.beforeSave()
-	var rcvBufSizeMax int = x.saveRcvBufSizeMax()
-	m.SaveValue("rcvBufSizeMax", rcvBufSizeMax)
-	m.Save("netProto", &x.netProto)
-	m.Save("waiterQueue", &x.waiterQueue)
-	m.Save("rcvReady", &x.rcvReady)
-	m.Save("rcvList", &x.rcvList)
-	m.Save("rcvBufSize", &x.rcvBufSize)
-	m.Save("rcvClosed", &x.rcvClosed)
-	m.Save("sndBufSize", &x.sndBufSize)
-	m.Save("id", &x.id)
-	m.Save("state", &x.state)
-	m.Save("bindNICID", &x.bindNICID)
-	m.Save("regNICID", &x.regNICID)
-	m.Save("dstPort", &x.dstPort)
-	m.Save("v6only", &x.v6only)
-	m.Save("multicastTTL", &x.multicastTTL)
-	m.Save("multicastAddr", &x.multicastAddr)
-	m.Save("multicastNICID", &x.multicastNICID)
-	m.Save("multicastLoop", &x.multicastLoop)
-	m.Save("reusePort", &x.reusePort)
-	m.Save("broadcast", &x.broadcast)
-	m.Save("shutdownFlags", &x.shutdownFlags)
-	m.Save("multicastMemberships", &x.multicastMemberships)
-	m.Save("effectiveNetProtos", &x.effectiveNetProtos)
+func (p *udpPacket) beforeSave() {}
+
+// +checklocksignore
+func (p *udpPacket) StateSave(stateSinkObject state.Sink) {
+	p.beforeSave()
+	var receivedAtValue int64
+	receivedAtValue = p.saveReceivedAt()
+	stateSinkObject.SaveValue(6, receivedAtValue)
+	stateSinkObject.Save(0, &p.udpPacketEntry)
+	stateSinkObject.Save(1, &p.netProto)
+	stateSinkObject.Save(2, &p.senderAddress)
+	stateSinkObject.Save(3, &p.destinationAddress)
+	stateSinkObject.Save(4, &p.packetInfo)
+	stateSinkObject.Save(5, &p.pkt)
+	stateSinkObject.Save(7, &p.tosOrTClass)
+	stateSinkObject.Save(8, &p.ttlOrHopLimit)
 }
 
-func (x *endpoint) load(m state.Map) {
-	m.Load("netProto", &x.netProto)
-	m.Load("waiterQueue", &x.waiterQueue)
-	m.Load("rcvReady", &x.rcvReady)
-	m.Load("rcvList", &x.rcvList)
-	m.Load("rcvBufSize", &x.rcvBufSize)
-	m.Load("rcvClosed", &x.rcvClosed)
-	m.Load("sndBufSize", &x.sndBufSize)
-	m.Load("id", &x.id)
-	m.Load("state", &x.state)
-	m.Load("bindNICID", &x.bindNICID)
-	m.Load("regNICID", &x.regNICID)
-	m.Load("dstPort", &x.dstPort)
-	m.Load("v6only", &x.v6only)
-	m.Load("multicastTTL", &x.multicastTTL)
-	m.Load("multicastAddr", &x.multicastAddr)
-	m.Load("multicastNICID", &x.multicastNICID)
-	m.Load("multicastLoop", &x.multicastLoop)
-	m.Load("reusePort", &x.reusePort)
-	m.Load("broadcast", &x.broadcast)
-	m.Load("shutdownFlags", &x.shutdownFlags)
-	m.Load("multicastMemberships", &x.multicastMemberships)
-	m.Load("effectiveNetProtos", &x.effectiveNetProtos)
-	m.LoadValue("rcvBufSizeMax", new(int), func(y interface{}) { x.loadRcvBufSizeMax(y.(int)) })
-	m.AfterLoad(x.afterLoad)
+func (p *udpPacket) afterLoad() {}
+
+// +checklocksignore
+func (p *udpPacket) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &p.udpPacketEntry)
+	stateSourceObject.Load(1, &p.netProto)
+	stateSourceObject.Load(2, &p.senderAddress)
+	stateSourceObject.Load(3, &p.destinationAddress)
+	stateSourceObject.Load(4, &p.packetInfo)
+	stateSourceObject.Load(5, &p.pkt)
+	stateSourceObject.Load(7, &p.tosOrTClass)
+	stateSourceObject.Load(8, &p.ttlOrHopLimit)
+	stateSourceObject.LoadValue(6, new(int64), func(y any) { p.loadReceivedAt(y.(int64)) })
 }
 
-func (x *multicastMembership) beforeSave() {}
-func (x *multicastMembership) save(m state.Map) {
-	x.beforeSave()
-	m.Save("nicID", &x.nicID)
-	m.Save("multicastAddr", &x.multicastAddr)
+func (e *endpoint) StateTypeName() string {
+	return "pkg/tcpip/transport/udp.endpoint"
 }
 
-func (x *multicastMembership) afterLoad() {}
-func (x *multicastMembership) load(m state.Map) {
-	m.Load("nicID", &x.nicID)
-	m.Load("multicastAddr", &x.multicastAddr)
+func (e *endpoint) StateFields() []string {
+	return []string{
+		"DefaultSocketOptionsHandler",
+		"waiterQueue",
+		"uniqueID",
+		"net",
+		"stats",
+		"ops",
+		"rcvReady",
+		"rcvList",
+		"rcvBufSize",
+		"rcvClosed",
+		"lastError",
+		"portFlags",
+		"boundBindToDevice",
+		"boundPortFlags",
+		"readShutdown",
+		"effectiveNetProtos",
+		"frozen",
+		"localPort",
+		"remotePort",
+	}
 }
 
-func (x *udpPacketList) beforeSave() {}
-func (x *udpPacketList) save(m state.Map) {
-	x.beforeSave()
-	m.Save("head", &x.head)
-	m.Save("tail", &x.tail)
+// +checklocksignore
+func (e *endpoint) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+	stateSinkObject.Save(0, &e.DefaultSocketOptionsHandler)
+	stateSinkObject.Save(1, &e.waiterQueue)
+	stateSinkObject.Save(2, &e.uniqueID)
+	stateSinkObject.Save(3, &e.net)
+	stateSinkObject.Save(4, &e.stats)
+	stateSinkObject.Save(5, &e.ops)
+	stateSinkObject.Save(6, &e.rcvReady)
+	stateSinkObject.Save(7, &e.rcvList)
+	stateSinkObject.Save(8, &e.rcvBufSize)
+	stateSinkObject.Save(9, &e.rcvClosed)
+	stateSinkObject.Save(10, &e.lastError)
+	stateSinkObject.Save(11, &e.portFlags)
+	stateSinkObject.Save(12, &e.boundBindToDevice)
+	stateSinkObject.Save(13, &e.boundPortFlags)
+	stateSinkObject.Save(14, &e.readShutdown)
+	stateSinkObject.Save(15, &e.effectiveNetProtos)
+	stateSinkObject.Save(16, &e.frozen)
+	stateSinkObject.Save(17, &e.localPort)
+	stateSinkObject.Save(18, &e.remotePort)
 }
 
-func (x *udpPacketList) afterLoad() {}
-func (x *udpPacketList) load(m state.Map) {
-	m.Load("head", &x.head)
-	m.Load("tail", &x.tail)
+// +checklocksignore
+func (e *endpoint) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &e.DefaultSocketOptionsHandler)
+	stateSourceObject.Load(1, &e.waiterQueue)
+	stateSourceObject.Load(2, &e.uniqueID)
+	stateSourceObject.Load(3, &e.net)
+	stateSourceObject.Load(4, &e.stats)
+	stateSourceObject.Load(5, &e.ops)
+	stateSourceObject.Load(6, &e.rcvReady)
+	stateSourceObject.Load(7, &e.rcvList)
+	stateSourceObject.Load(8, &e.rcvBufSize)
+	stateSourceObject.Load(9, &e.rcvClosed)
+	stateSourceObject.Load(10, &e.lastError)
+	stateSourceObject.Load(11, &e.portFlags)
+	stateSourceObject.Load(12, &e.boundBindToDevice)
+	stateSourceObject.Load(13, &e.boundPortFlags)
+	stateSourceObject.Load(14, &e.readShutdown)
+	stateSourceObject.Load(15, &e.effectiveNetProtos)
+	stateSourceObject.Load(16, &e.frozen)
+	stateSourceObject.Load(17, &e.localPort)
+	stateSourceObject.Load(18, &e.remotePort)
+	stateSourceObject.AfterLoad(e.afterLoad)
 }
 
-func (x *udpPacketEntry) beforeSave() {}
-func (x *udpPacketEntry) save(m state.Map) {
-	x.beforeSave()
-	m.Save("next", &x.next)
-	m.Save("prev", &x.prev)
+func (l *udpPacketList) StateTypeName() string {
+	return "pkg/tcpip/transport/udp.udpPacketList"
 }
 
-func (x *udpPacketEntry) afterLoad() {}
-func (x *udpPacketEntry) load(m state.Map) {
-	m.Load("next", &x.next)
-	m.Load("prev", &x.prev)
+func (l *udpPacketList) StateFields() []string {
+	return []string{
+		"head",
+		"tail",
+	}
+}
+
+func (l *udpPacketList) beforeSave() {}
+
+// +checklocksignore
+func (l *udpPacketList) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.head)
+	stateSinkObject.Save(1, &l.tail)
+}
+
+func (l *udpPacketList) afterLoad() {}
+
+// +checklocksignore
+func (l *udpPacketList) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.head)
+	stateSourceObject.Load(1, &l.tail)
+}
+
+func (e *udpPacketEntry) StateTypeName() string {
+	return "pkg/tcpip/transport/udp.udpPacketEntry"
+}
+
+func (e *udpPacketEntry) StateFields() []string {
+	return []string{
+		"next",
+		"prev",
+	}
+}
+
+func (e *udpPacketEntry) beforeSave() {}
+
+// +checklocksignore
+func (e *udpPacketEntry) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+	stateSinkObject.Save(0, &e.next)
+	stateSinkObject.Save(1, &e.prev)
+}
+
+func (e *udpPacketEntry) afterLoad() {}
+
+// +checklocksignore
+func (e *udpPacketEntry) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &e.next)
+	stateSourceObject.Load(1, &e.prev)
 }
 
 func init() {
-	state.Register("udp.udpPacket", (*udpPacket)(nil), state.Fns{Save: (*udpPacket).save, Load: (*udpPacket).load})
-	state.Register("udp.endpoint", (*endpoint)(nil), state.Fns{Save: (*endpoint).save, Load: (*endpoint).load})
-	state.Register("udp.multicastMembership", (*multicastMembership)(nil), state.Fns{Save: (*multicastMembership).save, Load: (*multicastMembership).load})
-	state.Register("udp.udpPacketList", (*udpPacketList)(nil), state.Fns{Save: (*udpPacketList).save, Load: (*udpPacketList).load})
-	state.Register("udp.udpPacketEntry", (*udpPacketEntry)(nil), state.Fns{Save: (*udpPacketEntry).save, Load: (*udpPacketEntry).load})
+	state.Register((*udpPacket)(nil))
+	state.Register((*endpoint)(nil))
+	state.Register((*udpPacketList)(nil))
+	state.Register((*udpPacketEntry)(nil))
 }

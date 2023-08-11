@@ -6,17 +6,31 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *Manager) beforeSave() {}
-func (x *Manager) save(m state.Map) {
-	x.beforeSave()
-	m.Save("ports", &x.ports)
+func (m *Manager) StateTypeName() string {
+	return "pkg/sentry/socket/netlink/port.Manager"
 }
 
-func (x *Manager) afterLoad() {}
-func (x *Manager) load(m state.Map) {
-	m.Load("ports", &x.ports)
+func (m *Manager) StateFields() []string {
+	return []string{
+		"ports",
+	}
+}
+
+func (m *Manager) beforeSave() {}
+
+// +checklocksignore
+func (m *Manager) StateSave(stateSinkObject state.Sink) {
+	m.beforeSave()
+	stateSinkObject.Save(0, &m.ports)
+}
+
+func (m *Manager) afterLoad() {}
+
+// +checklocksignore
+func (m *Manager) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &m.ports)
 }
 
 func init() {
-	state.Register("port.Manager", (*Manager)(nil), state.Fns{Save: (*Manager).save, Load: (*Manager).load})
+	state.Register((*Manager)(nil))
 }

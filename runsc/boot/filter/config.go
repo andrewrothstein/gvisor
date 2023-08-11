@@ -16,7 +16,6 @@ package filter
 
 import (
 	"os"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -26,448 +25,462 @@ import (
 
 // allowedSyscalls is the set of syscalls executed by the Sentry to the host OS.
 var allowedSyscalls = seccomp.SyscallRules{
-	syscall.SYS_ARCH_PRCTL: []seccomp.Rule{
-		{seccomp.AllowValue(linux.ARCH_GET_FS)},
-		{seccomp.AllowValue(linux.ARCH_SET_FS)},
-	},
-	syscall.SYS_CLOCK_GETTIME: {},
-	syscall.SYS_CLONE: []seccomp.Rule{
+	unix.SYS_CLOCK_GETTIME: {},
+	unix.SYS_CLOSE:         {},
+	unix.SYS_DUP:           {},
+	unix.SYS_DUP3: []seccomp.Rule{
 		{
-			seccomp.AllowValue(
-				syscall.CLONE_VM |
-					syscall.CLONE_FS |
-					syscall.CLONE_FILES |
-					syscall.CLONE_SIGHAND |
-					syscall.CLONE_SYSVSEM |
-					syscall.CLONE_THREAD),
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.O_CLOEXEC),
 		},
 	},
-	syscall.SYS_CLOSE:         {},
-	syscall.SYS_DUP:           {},
-	syscall.SYS_EPOLL_CREATE1: {},
-	syscall.SYS_EPOLL_CTL:     {},
-	syscall.SYS_EPOLL_PWAIT: []seccomp.Rule{
+	unix.SYS_EPOLL_CREATE1: {},
+	unix.SYS_EPOLL_CTL:     {},
+	unix.SYS_EPOLL_PWAIT: []seccomp.Rule{
 		{
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowValue(0),
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(0),
 		},
 	},
-	syscall.SYS_EVENTFD2: []seccomp.Rule{
+	unix.SYS_EVENTFD2: []seccomp.Rule{
 		{
-			seccomp.AllowValue(0),
-			seccomp.AllowValue(0),
+			seccomp.EqualTo(0),
+			seccomp.EqualTo(0),
 		},
 	},
-	syscall.SYS_EXIT:       {},
-	syscall.SYS_EXIT_GROUP: {},
-	syscall.SYS_FALLOCATE:  {},
-	syscall.SYS_FCHMOD:     {},
-	syscall.SYS_FCNTL: []seccomp.Rule{
+	unix.SYS_EXIT:       {},
+	unix.SYS_EXIT_GROUP: {},
+	unix.SYS_FALLOCATE:  {},
+	unix.SYS_FCHMOD:     {},
+	unix.SYS_FCNTL: []seccomp.Rule{
 		{
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.F_GETFL),
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.F_GETFL),
 		},
 		{
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.F_SETFL),
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.F_SETFL),
 		},
 		{
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.F_GETFD),
-		},
-	},
-	syscall.SYS_FSTAT:     {},
-	syscall.SYS_FSYNC:     {},
-	syscall.SYS_FTRUNCATE: {},
-	syscall.SYS_FUTEX: []seccomp.Rule{
-		{
-			seccomp.AllowAny{},
-			seccomp.AllowValue(linux.FUTEX_WAIT | linux.FUTEX_PRIVATE_FLAG),
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowValue(0),
-		},
-		{
-			seccomp.AllowAny{},
-			seccomp.AllowValue(linux.FUTEX_WAKE | linux.FUTEX_PRIVATE_FLAG),
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowValue(0),
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.F_GETFD),
 		},
 	},
-	syscall.SYS_GETPID: {},
+	unix.SYS_FSTAT:     {},
+	unix.SYS_FSYNC:     {},
+	unix.SYS_FTRUNCATE: {},
+	unix.SYS_FUTEX: []seccomp.Rule{
+		{
+			seccomp.MatchAny{},
+			seccomp.EqualTo(linux.FUTEX_WAIT | linux.FUTEX_PRIVATE_FLAG),
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+		},
+		{
+			seccomp.MatchAny{},
+			seccomp.EqualTo(linux.FUTEX_WAKE | linux.FUTEX_PRIVATE_FLAG),
+			seccomp.MatchAny{},
+		},
+		// Non-private variants are included for flipcall support. They are otherwise
+		// unncessary, as the sentry will use only private futexes internally.
+		{
+			seccomp.MatchAny{},
+			seccomp.EqualTo(linux.FUTEX_WAIT),
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+		},
+		{
+			seccomp.MatchAny{},
+			seccomp.EqualTo(linux.FUTEX_WAKE),
+			seccomp.MatchAny{},
+		},
+	},
+	// getcpu is used by some versions of the Go runtime and by the hostcpu
+	// package on arm64.
+	unix.SYS_GETCPU: []seccomp.Rule{
+		{
+			seccomp.MatchAny{},
+			seccomp.EqualTo(0),
+			seccomp.EqualTo(0),
+		},
+	},
+	unix.SYS_GETPID:    {},
 	unix.SYS_GETRANDOM: {},
-	syscall.SYS_GETSOCKOPT: []seccomp.Rule{
+	unix.SYS_GETSOCKOPT: []seccomp.Rule{
 		{
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.SOL_SOCKET),
-			seccomp.AllowValue(syscall.SO_DOMAIN),
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.SOL_SOCKET),
+			seccomp.EqualTo(unix.SO_DOMAIN),
 		},
 		{
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.SOL_SOCKET),
-			seccomp.AllowValue(syscall.SO_TYPE),
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.SOL_SOCKET),
+			seccomp.EqualTo(unix.SO_TYPE),
 		},
 		{
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.SOL_SOCKET),
-			seccomp.AllowValue(syscall.SO_ERROR),
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.SOL_SOCKET),
+			seccomp.EqualTo(unix.SO_ERROR),
 		},
 		{
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.SOL_SOCKET),
-			seccomp.AllowValue(syscall.SO_SNDBUF),
-		},
-		{
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.SOL_SOCKET),
-			seccomp.AllowValue(syscall.SO_REUSEADDR),
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.SOL_SOCKET),
+			seccomp.EqualTo(unix.SO_SNDBUF),
 		},
 	},
-	syscall.SYS_GETTID:       {},
-	syscall.SYS_GETTIMEOFDAY: {},
-	// SYS_IOCTL is needed for terminal support, but we only allow
-	// setting/getting termios and winsize.
-	syscall.SYS_IOCTL: []seccomp.Rule{
+	unix.SYS_GETTID:       {},
+	unix.SYS_GETTIMEOFDAY: {},
+	unix.SYS_IOCTL: []seccomp.Rule{
+		// These commands are needed for host FD.
 		{
-			seccomp.AllowAny{}, /* fd */
-			seccomp.AllowValue(linux.TCGETS),
-			seccomp.AllowAny{}, /* termios struct */
+			seccomp.MatchAny{}, /* fd */
+			seccomp.EqualTo(linux.FIONREAD),
+			seccomp.MatchAny{}, /* int* */
+		},
+		// These commands are needed for terminal support, but we only allow
+		// setting/getting termios and winsize.
+		{
+			seccomp.MatchAny{}, /* fd */
+			seccomp.EqualTo(linux.TCGETS),
+			seccomp.MatchAny{}, /* termios struct */
 		},
 		{
-			seccomp.AllowAny{}, /* fd */
-			seccomp.AllowValue(linux.TCSETS),
-			seccomp.AllowAny{}, /* termios struct */
+			seccomp.MatchAny{}, /* fd */
+			seccomp.EqualTo(linux.TCSETS),
+			seccomp.MatchAny{}, /* termios struct */
 		},
 		{
-			seccomp.AllowAny{}, /* fd */
-			seccomp.AllowValue(linux.TCSETSF),
-			seccomp.AllowAny{}, /* termios struct */
+			seccomp.MatchAny{}, /* fd */
+			seccomp.EqualTo(linux.TCSETSF),
+			seccomp.MatchAny{}, /* termios struct */
 		},
 		{
-			seccomp.AllowAny{}, /* fd */
-			seccomp.AllowValue(linux.TCSETSW),
-			seccomp.AllowAny{}, /* termios struct */
+			seccomp.MatchAny{}, /* fd */
+			seccomp.EqualTo(linux.TCSETSW),
+			seccomp.MatchAny{}, /* termios struct */
 		},
 		{
-			seccomp.AllowAny{}, /* fd */
-			seccomp.AllowValue(linux.TIOCSWINSZ),
-			seccomp.AllowAny{}, /* winsize struct */
+			seccomp.MatchAny{}, /* fd */
+			seccomp.EqualTo(linux.TIOCSWINSZ),
+			seccomp.MatchAny{}, /* winsize struct */
 		},
 		{
-			seccomp.AllowAny{}, /* fd */
-			seccomp.AllowValue(linux.TIOCGWINSZ),
-			seccomp.AllowAny{}, /* winsize struct */
-		},
-	},
-	syscall.SYS_LSEEK:   {},
-	syscall.SYS_MADVISE: {},
-	syscall.SYS_MINCORE: {},
-	syscall.SYS_MMAP: []seccomp.Rule{
-		{
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.MAP_SHARED),
+			seccomp.MatchAny{}, /* fd */
+			seccomp.EqualTo(linux.TIOCGWINSZ),
+			seccomp.MatchAny{}, /* winsize struct */
 		},
 		{
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.MAP_PRIVATE),
-		},
-		{
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.MAP_PRIVATE | syscall.MAP_ANONYMOUS),
-		},
-		{
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.MAP_PRIVATE | syscall.MAP_ANONYMOUS | syscall.MAP_STACK),
-		},
-		{
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.MAP_PRIVATE | syscall.MAP_ANONYMOUS | syscall.MAP_NORESERVE),
-		},
-		{
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.PROT_WRITE | syscall.PROT_READ),
-			seccomp.AllowValue(syscall.MAP_PRIVATE | syscall.MAP_ANONYMOUS | syscall.MAP_FIXED),
+			seccomp.MatchAny{}, /* fd */
+			seccomp.EqualTo(linux.SIOCGIFTXQLEN),
+			seccomp.MatchAny{}, /* ifreq struct */
 		},
 	},
-	syscall.SYS_MPROTECT:  {},
-	syscall.SYS_MUNMAP:    {},
-	syscall.SYS_NANOSLEEP: {},
-	syscall.SYS_PPOLL:     {},
-	syscall.SYS_PREAD64:   {},
-	syscall.SYS_PWRITE64:  {},
-	syscall.SYS_READ:      {},
-	syscall.SYS_RECVMSG: []seccomp.Rule{
+	unix.SYS_LSEEK:   {},
+	unix.SYS_MADVISE: {},
+	unix.SYS_MEMBARRIER: []seccomp.Rule{
 		{
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.MSG_DONTWAIT | syscall.MSG_TRUNC),
-		},
-		{
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.MSG_DONTWAIT | syscall.MSG_TRUNC | syscall.MSG_PEEK),
+			seccomp.EqualTo(linux.MEMBARRIER_CMD_GLOBAL),
+			seccomp.EqualTo(0),
 		},
 	},
-	syscall.SYS_RECVMMSG: []seccomp.Rule{
+	unix.SYS_MINCORE: {},
+	unix.SYS_MLOCK:   {},
+	unix.SYS_MMAP: []seccomp.Rule{
 		{
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowValue(fdbased.MaxMsgsPerRecv),
-			seccomp.AllowValue(syscall.MSG_DONTWAIT),
-			seccomp.AllowValue(0),
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.MAP_SHARED),
+		},
+		{
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.MAP_SHARED | unix.MAP_FIXED),
+		},
+		{
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.MAP_PRIVATE),
+		},
+		{
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.MAP_PRIVATE | unix.MAP_ANONYMOUS),
+		},
+		{
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.MAP_PRIVATE | unix.MAP_ANONYMOUS | unix.MAP_STACK),
+		},
+		{
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.MAP_PRIVATE | unix.MAP_ANONYMOUS | unix.MAP_NORESERVE),
+		},
+		{
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.PROT_WRITE | unix.PROT_READ),
+			seccomp.EqualTo(unix.MAP_PRIVATE | unix.MAP_ANONYMOUS | unix.MAP_FIXED),
 		},
 	},
-	syscall.SYS_RESTART_SYSCALL: {},
-	syscall.SYS_RT_SIGACTION:    {},
-	syscall.SYS_RT_SIGPROCMASK:  {},
-	syscall.SYS_RT_SIGRETURN:    {},
-	syscall.SYS_SCHED_YIELD:     {},
-	syscall.SYS_SENDMSG: []seccomp.Rule{
+	unix.SYS_MPROTECT:  {},
+	unix.SYS_MUNLOCK:   {},
+	unix.SYS_MUNMAP:    {},
+	unix.SYS_NANOSLEEP: {},
+	unix.SYS_PPOLL:     {},
+	unix.SYS_PREAD64:   {},
+	unix.SYS_PREADV:    {},
+	unix.SYS_PREADV2:   {},
+	unix.SYS_PWRITE64:  {},
+	unix.SYS_PWRITEV:   {},
+	unix.SYS_PWRITEV2:  {},
+	unix.SYS_READ:      {},
+	unix.SYS_RECVMSG: []seccomp.Rule{
 		{
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowValue(syscall.MSG_DONTWAIT | syscall.MSG_NOSIGNAL),
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.MSG_DONTWAIT | unix.MSG_TRUNC),
+		},
+		{
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.MSG_DONTWAIT | unix.MSG_TRUNC | unix.MSG_PEEK),
 		},
 	},
-	syscall.SYS_SETITIMER: {},
-	syscall.SYS_SHUTDOWN: []seccomp.Rule{
+	unix.SYS_RECVMMSG: []seccomp.Rule{
+		{
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(fdbased.MaxMsgsPerRecv),
+			seccomp.EqualTo(unix.MSG_DONTWAIT),
+			seccomp.EqualTo(0),
+		},
+	},
+	unix.SYS_SENDMMSG: []seccomp.Rule{
+		{
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.MSG_DONTWAIT),
+		},
+	},
+	unix.SYS_RESTART_SYSCALL: {},
+	unix.SYS_RT_SIGACTION:    {},
+	unix.SYS_RT_SIGPROCMASK:  {},
+	unix.SYS_RT_SIGRETURN:    {},
+	unix.SYS_SCHED_YIELD:     {},
+	unix.SYS_SENDMSG: []seccomp.Rule{
+		{
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(unix.MSG_DONTWAIT | unix.MSG_NOSIGNAL),
+		},
+	},
+	unix.SYS_SETITIMER: {},
+	unix.SYS_SHUTDOWN: []seccomp.Rule{
 		// Used by fs/host to shutdown host sockets.
-		{seccomp.AllowAny{}, seccomp.AllowValue(syscall.SHUT_RD)},
-		{seccomp.AllowAny{}, seccomp.AllowValue(syscall.SHUT_WR)},
+		{seccomp.MatchAny{}, seccomp.EqualTo(unix.SHUT_RD)},
+		{seccomp.MatchAny{}, seccomp.EqualTo(unix.SHUT_WR)},
 		// Used by unet to shutdown connections.
-		{seccomp.AllowAny{}, seccomp.AllowValue(syscall.SHUT_RDWR)},
+		{seccomp.MatchAny{}, seccomp.EqualTo(unix.SHUT_RDWR)},
 	},
-	syscall.SYS_SIGALTSTACK:     {},
-	syscall.SYS_SYNC_FILE_RANGE: {},
-	syscall.SYS_TGKILL: []seccomp.Rule{
+	unix.SYS_SIGALTSTACK:     {},
+	unix.SYS_STATX:           {},
+	unix.SYS_SYNC_FILE_RANGE: {},
+	unix.SYS_TEE: []seccomp.Rule{
 		{
-			seccomp.AllowValue(uint64(os.Getpid())),
-		},
-	},
-	syscall.SYS_WRITE: {},
-	// The only user in rawfile.NonBlockingWrite3 always passes iovcnt with
-	// values 2 or 3. Three iovec-s are passed, when the PACKET_VNET_HDR
-	// option is enabled for a packet socket.
-	syscall.SYS_WRITEV: []seccomp.Rule{
-		{
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowValue(2),
-		},
-		{
-			seccomp.AllowAny{},
-			seccomp.AllowAny{},
-			seccomp.AllowValue(3),
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.EqualTo(1),                      /* len */
+			seccomp.EqualTo(unix.SPLICE_F_NONBLOCK), /* flags */
 		},
 	},
-}
-
-// hostInetFilters contains syscalls that are needed by sentry/socket/hostinet.
-func hostInetFilters() seccomp.SyscallRules {
-	return seccomp.SyscallRules{
-		syscall.SYS_ACCEPT4: []seccomp.Rule{
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowAny{},
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOCK_NONBLOCK | syscall.SOCK_CLOEXEC),
-			},
+	unix.SYS_TIMER_CREATE: []seccomp.Rule{
+		{
+			seccomp.EqualTo(unix.CLOCK_THREAD_CPUTIME_ID), /* which */
+			seccomp.MatchAny{},                            /* sevp */
+			seccomp.MatchAny{},                            /* timerid */
 		},
-		syscall.SYS_BIND:        {},
-		syscall.SYS_CONNECT:     {},
-		syscall.SYS_GETPEERNAME: {},
-		syscall.SYS_GETSOCKNAME: {},
-		syscall.SYS_GETSOCKOPT: []seccomp.Rule{
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_IPV6),
-				seccomp.AllowValue(syscall.IPV6_V6ONLY),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_SOCKET),
-				seccomp.AllowValue(syscall.SO_ERROR),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_SOCKET),
-				seccomp.AllowValue(syscall.SO_KEEPALIVE),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_SOCKET),
-				seccomp.AllowValue(syscall.SO_SNDBUF),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_SOCKET),
-				seccomp.AllowValue(syscall.SO_RCVBUF),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_SOCKET),
-				seccomp.AllowValue(syscall.SO_REUSEADDR),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_SOCKET),
-				seccomp.AllowValue(syscall.SO_TYPE),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_SOCKET),
-				seccomp.AllowValue(syscall.SO_LINGER),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_TCP),
-				seccomp.AllowValue(syscall.TCP_NODELAY),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_TCP),
-				seccomp.AllowValue(syscall.TCP_INFO),
-			},
+	},
+	unix.SYS_TIMER_DELETE: []seccomp.Rule{},
+	unix.SYS_TIMER_SETTIME: []seccomp.Rule{
+		{
+			seccomp.MatchAny{}, /* timerid */
+			seccomp.EqualTo(0), /* flags */
+			seccomp.MatchAny{}, /* new_value */
+			seccomp.EqualTo(0), /* old_value */
 		},
-		syscall.SYS_IOCTL: []seccomp.Rule{
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.TIOCOUTQ),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.TIOCINQ),
-			},
+	},
+	unix.SYS_TGKILL: []seccomp.Rule{
+		{
+			seccomp.EqualTo(uint64(os.Getpid())),
 		},
-		syscall.SYS_LISTEN:   {},
-		syscall.SYS_READV:    {},
-		syscall.SYS_RECVFROM: {},
-		syscall.SYS_RECVMSG:  {},
-		syscall.SYS_SENDMSG:  {},
-		syscall.SYS_SENDTO:   {},
-		syscall.SYS_SETSOCKOPT: []seccomp.Rule{
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_IPV6),
-				seccomp.AllowValue(syscall.IPV6_V6ONLY),
-				seccomp.AllowAny{},
-				seccomp.AllowValue(4),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_SOCKET),
-				seccomp.AllowValue(syscall.SO_SNDBUF),
-				seccomp.AllowAny{},
-				seccomp.AllowValue(4),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_SOCKET),
-				seccomp.AllowValue(syscall.SO_RCVBUF),
-				seccomp.AllowAny{},
-				seccomp.AllowValue(4),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_SOCKET),
-				seccomp.AllowValue(syscall.SO_REUSEADDR),
-				seccomp.AllowAny{},
-				seccomp.AllowValue(4),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_TCP),
-				seccomp.AllowValue(syscall.TCP_NODELAY),
-				seccomp.AllowAny{},
-				seccomp.AllowValue(4),
-			},
+	},
+	unix.SYS_UTIMENSAT: []seccomp.Rule{
+		{
+			seccomp.MatchAny{},
+			seccomp.EqualTo(0), /* null pathname */
+			seccomp.MatchAny{},
+			seccomp.EqualTo(0), /* flags */
 		},
-		syscall.SYS_SHUTDOWN: []seccomp.Rule{
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SHUT_RD),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SHUT_WR),
-			},
-			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SHUT_RDWR),
-			},
+	},
+	unix.SYS_WRITE: {},
+	// For rawfile.NonBlockingWriteIovec.
+	unix.SYS_WRITEV: []seccomp.Rule{
+		{
+			seccomp.MatchAny{},
+			seccomp.MatchAny{},
+			seccomp.GreaterThan(0),
 		},
-		syscall.SYS_SOCKET: []seccomp.Rule{
-			{
-				seccomp.AllowValue(syscall.AF_INET),
-				seccomp.AllowValue(syscall.SOCK_STREAM | syscall.SOCK_NONBLOCK | syscall.SOCK_CLOEXEC),
-				seccomp.AllowValue(0),
-			},
-			{
-				seccomp.AllowValue(syscall.AF_INET),
-				seccomp.AllowValue(syscall.SOCK_DGRAM | syscall.SOCK_NONBLOCK | syscall.SOCK_CLOEXEC),
-				seccomp.AllowValue(0),
-			},
-			{
-				seccomp.AllowValue(syscall.AF_INET6),
-				seccomp.AllowValue(syscall.SOCK_STREAM | syscall.SOCK_NONBLOCK | syscall.SOCK_CLOEXEC),
-				seccomp.AllowValue(0),
-			},
-			{
-				seccomp.AllowValue(syscall.AF_INET6),
-				seccomp.AllowValue(syscall.SOCK_DGRAM | syscall.SOCK_NONBLOCK | syscall.SOCK_CLOEXEC),
-				seccomp.AllowValue(0),
-			},
-		},
-		syscall.SYS_WRITEV: {},
-	}
+	},
 }
 
 func controlServerFilters(fd int) seccomp.SyscallRules {
 	return seccomp.SyscallRules{
-		syscall.SYS_ACCEPT: []seccomp.Rule{
+		unix.SYS_ACCEPT4: []seccomp.Rule{
 			{
-				seccomp.AllowValue(fd),
+				seccomp.EqualTo(fd),
 			},
 		},
-		syscall.SYS_LISTEN: []seccomp.Rule{
+		unix.SYS_LISTEN: []seccomp.Rule{
 			{
-				seccomp.AllowValue(fd),
-				seccomp.AllowValue(16 /* unet.backlog */),
+				seccomp.EqualTo(fd),
+				seccomp.EqualTo(16 /* unet.backlog */),
 			},
 		},
-		syscall.SYS_GETSOCKOPT: []seccomp.Rule{
+		unix.SYS_GETSOCKOPT: []seccomp.Rule{
 			{
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.SOL_SOCKET),
-				seccomp.AllowValue(syscall.SO_PEERCRED),
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_SOCKET),
+				seccomp.EqualTo(unix.SO_PEERCRED),
 			},
 		},
 	}
 }
 
-// profileFilters returns extra syscalls made by runtime/pprof package.
-func profileFilters() seccomp.SyscallRules {
+// hostFilesystemFilters contains syscalls that are needed by directfs.
+func hostFilesystemFilters() seccomp.SyscallRules {
+	// Directfs allows FD-based filesystem syscalls. We deny these syscalls with
+	// negative FD values (like AT_FDCWD or invalid FD numbers). We try to be as
+	// restrictive as possible because any restriction here improves security. We
+	// don't know what set of arguments will trigger a future vulnerability.
+	validFDCheck := seccomp.NonNegativeFDCheck()
 	return seccomp.SyscallRules{
-		syscall.SYS_OPENAT: []seccomp.Rule{
+		unix.SYS_FCHOWNAT: []seccomp.Rule{
 			{
-				seccomp.AllowAny{},
-				seccomp.AllowAny{},
-				seccomp.AllowValue(syscall.O_RDONLY | syscall.O_LARGEFILE | syscall.O_CLOEXEC),
+				validFDCheck,
+				seccomp.MatchAny{},
+				seccomp.MatchAny{},
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.AT_EMPTY_PATH | unix.AT_SYMLINK_NOFOLLOW),
+			},
+		},
+		unix.SYS_FCHMODAT: []seccomp.Rule{
+			{
+				validFDCheck,
+				seccomp.MatchAny{},
+				seccomp.MatchAny{},
+			},
+		},
+		unix.SYS_UNLINKAT: []seccomp.Rule{
+			{
+				validFDCheck,
+				seccomp.MatchAny{},
+				seccomp.MatchAny{},
+			},
+		},
+		unix.SYS_GETDENTS64: []seccomp.Rule{
+			{
+				validFDCheck,
+				seccomp.MatchAny{},
+				seccomp.MatchAny{},
+			},
+		},
+		unix.SYS_OPENAT: []seccomp.Rule{
+			{
+				validFDCheck,
+				seccomp.MatchAny{},
+				seccomp.MaskedEqual(unix.O_NOFOLLOW, unix.O_NOFOLLOW),
+				seccomp.MatchAny{},
+			},
+		},
+		unix.SYS_LINKAT: []seccomp.Rule{
+			{
+				validFDCheck,
+				seccomp.MatchAny{},
+				validFDCheck,
+				seccomp.MatchAny{},
+				seccomp.EqualTo(0),
+			},
+		},
+		unix.SYS_MKDIRAT: []seccomp.Rule{
+			{
+				validFDCheck,
+				seccomp.MatchAny{},
+				seccomp.MatchAny{},
+			},
+		},
+		unix.SYS_MKNODAT: []seccomp.Rule{
+			{
+				validFDCheck,
+				seccomp.MatchAny{},
+				seccomp.MatchAny{},
+				seccomp.MatchAny{},
+			},
+		},
+		unix.SYS_SYMLINKAT: []seccomp.Rule{
+			{
+				seccomp.MatchAny{},
+				validFDCheck,
+				seccomp.MatchAny{},
+			},
+		},
+		unix.SYS_FSTATFS: []seccomp.Rule{
+			{
+				validFDCheck,
+				seccomp.MatchAny{},
+			},
+		},
+		unix.SYS_READLINKAT: []seccomp.Rule{
+			{
+				validFDCheck,
+				seccomp.MatchAny{},
+				seccomp.MatchAny{},
+				seccomp.MatchAny{},
+			},
+		},
+		unix.SYS_UTIMENSAT: []seccomp.Rule{
+			{
+				validFDCheck,
+				seccomp.MatchAny{},
+				seccomp.MatchAny{},
+				seccomp.MatchAny{},
+			},
+		},
+		unix.SYS_RENAMEAT: []seccomp.Rule{
+			{
+				validFDCheck,
+				seccomp.MatchAny{},
+				validFDCheck,
+				seccomp.MatchAny{},
+			},
+		},
+		archFstatAtSysNo(): []seccomp.Rule{
+			{
+				validFDCheck,
+				seccomp.MatchAny{},
+				seccomp.MatchAny{},
+				seccomp.MatchAny{},
 			},
 		},
 	}

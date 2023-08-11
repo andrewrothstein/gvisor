@@ -18,10 +18,11 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/sentry/context"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sockfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserr"
 )
 
@@ -30,12 +31,19 @@ type Protocol interface {
 	// Protocol returns the Linux netlink protocol value.
 	Protocol() int
 
+	// CanSend returns true if this protocol may ever send messages.
+	//
+	// TODO(gvisor.dev/issue/1119): This is a workaround to allow
+	// advertising support for otherwise unimplemented features on sockets
+	// that will never send messages, thus making those features no-ops.
+	CanSend() bool
+
 	// ProcessMessage processes a single message from userspace.
 	//
 	// If err == nil, any messages added to ms will be sent back to the
 	// other end of the socket. Setting ms.Multi will cause an NLMSG_DONE
 	// message to be sent even if ms contains no messages.
-	ProcessMessage(ctx context.Context, hdr linux.NetlinkMessageHeader, data []byte, ms *MessageSet) *syserr.Error
+	ProcessMessage(ctx context.Context, msg *Message, ms *MessageSet) *syserr.Error
 }
 
 // Provider is a function that creates a new Protocol for a specific netlink
@@ -65,7 +73,7 @@ type socketProvider struct {
 }
 
 // Socket implements socket.Provider.Socket.
-func (*socketProvider) Socket(t *kernel.Task, stype linux.SockType, protocol int) (*fs.File, *syserr.Error) {
+func (*socketProvider) Socket(t *kernel.Task, stype linux.SockType, protocol int) (*vfs.FileDescription, *syserr.Error) {
 	// Netlink sockets must be specified as datagram or raw, but they
 	// behave the same regardless of type.
 	if stype != linux.SOCK_DGRAM && stype != linux.SOCK_RAW {
@@ -82,18 +90,27 @@ func (*socketProvider) Socket(t *kernel.Task, stype linux.SockType, protocol int
 		return nil, err
 	}
 
-	s, err := NewSocket(t, stype, p)
+	s, err := New(t, stype, p)
 	if err != nil {
 		return nil, err
 	}
 
-	d := socket.NewDirent(t, netlinkSocketDevice)
-	defer d.DecRef()
-	return fs.NewFile(t, d, fs.FileFlags{Read: true, Write: true, NonSeekable: true}, s), nil
+	vfsfd := &s.vfsfd
+	mnt := t.Kernel().SocketMount()
+	d := sockfs.NewDentry(t, mnt)
+	defer d.DecRef(t)
+	if err := vfsfd.Init(s, linux.O_RDWR, mnt, d, &vfs.FileDescriptionOptions{
+		DenyPRead:         true,
+		DenyPWrite:        true,
+		UseDentryMetadata: true,
+	}); err != nil {
+		return nil, syserr.FromError(err)
+	}
+	return vfsfd, nil
 }
 
 // Pair implements socket.Provider.Pair by returning an error.
-func (*socketProvider) Pair(*kernel.Task, linux.SockType, int) (*fs.File, *fs.File, *syserr.Error) {
+func (*socketProvider) Pair(*kernel.Task, linux.SockType, int) (*vfs.FileDescription, *vfs.FileDescription, *syserr.Error) {
 	// Netlink sockets never supports creating socket pairs.
 	return nil, nil, syserr.ErrNotSupported
 }

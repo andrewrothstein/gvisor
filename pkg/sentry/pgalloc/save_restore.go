@@ -16,20 +16,22 @@ package pgalloc
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"runtime"
-	"sync/atomic"
-	"syscall"
 
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
 	"gvisor.dev/gvisor/pkg/state"
+	"gvisor.dev/gvisor/pkg/state/wire"
 )
 
 // SaveTo writes f's state to the given stream.
-func (f *MemoryFile) SaveTo(w io.Writer) error {
+func (f *MemoryFile) SaveTo(ctx context.Context, w wire.Writer) error {
 	// Wait for reclaim.
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -47,11 +49,11 @@ func (f *MemoryFile) SaveTo(w io.Writer) error {
 
 	// Ensure that all pages that contain data have knownCommitted set, since
 	// we only store knownCommitted pages below.
-	zeroPage := make([]byte, usermem.PageSize)
+	zeroPage := make([]byte, hostarch.PageSize)
 	err := f.updateUsageLocked(0, func(bs []byte, committed []byte) error {
-		for pgoff := 0; pgoff < len(bs); pgoff += usermem.PageSize {
-			i := pgoff / usermem.PageSize
-			pg := bs[pgoff : pgoff+usermem.PageSize]
+		for pgoff := 0; pgoff < len(bs); pgoff += hostarch.PageSize {
+			i := pgoff / hostarch.PageSize
+			pg := bs[pgoff : pgoff+hostarch.PageSize]
 			if !bytes.Equal(pg, zeroPage) {
 				committed[i] = 1
 				continue
@@ -64,7 +66,7 @@ func (f *MemoryFile) SaveTo(w io.Writer) error {
 			// associated backing store. This is equivalent to punching a hole
 			// in the corresponding byte range of the backing store (see
 			// fallocate(2))." - madvise(2)
-			if err := syscall.Madvise(pg, syscall.MADV_REMOVE); err != nil {
+			if err := unix.Madvise(pg, unix.MADV_REMOVE); err != nil {
 				// This doesn't impact the correctness of saved memory, it
 				// just means that we're incrementally more likely to OOM.
 				// Complain, but don't abort saving.
@@ -78,10 +80,10 @@ func (f *MemoryFile) SaveTo(w io.Writer) error {
 	}
 
 	// Save metadata.
-	if err := state.Save(w, &f.fileSize, nil); err != nil {
+	if _, err := state.Save(ctx, w, &f.fileSize); err != nil {
 		return err
 	}
-	if err := state.Save(w, &f.usage, nil); err != nil {
+	if _, err := state.Save(ctx, w, &f.usage); err != nil {
 		return err
 	}
 
@@ -114,9 +116,9 @@ func (f *MemoryFile) SaveTo(w io.Writer) error {
 }
 
 // LoadFrom loads MemoryFile state from the given stream.
-func (f *MemoryFile) LoadFrom(r io.Reader) error {
+func (f *MemoryFile) LoadFrom(ctx context.Context, r wire.Reader) error {
 	// Load metadata.
-	if err := state.Load(r, &f.fileSize, nil); err != nil {
+	if _, err := state.Load(ctx, r, &f.fileSize); err != nil {
 		return err
 	}
 	if err := f.file.Truncate(f.fileSize); err != nil {
@@ -124,7 +126,7 @@ func (f *MemoryFile) LoadFrom(r io.Reader) error {
 	}
 	newMappings := make([]uintptr, f.fileSize>>chunkShift)
 	f.mappings.Store(newMappings)
-	if err := state.Load(r, &f.usage, nil); err != nil {
+	if _, err := state.Load(ctx, r, &f.usage); err != nil {
 		return err
 	}
 
@@ -134,11 +136,11 @@ func (f *MemoryFile) LoadFrom(r io.Reader) error {
 	// other since it doesn't do any work between mmaps. The rest of this
 	// function doesn't mutate f.usage, so it's safe to iterate concurrently.
 	mapperDone := make(chan struct{})
-	mapperCanceled := int32(0)
+	mapperCanceled := atomicbitops.FromInt32(0)
 	go func() { // S/R-SAFE: see comment
 		defer func() { close(mapperDone) }()
 		for seg := f.usage.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
-			if atomic.LoadInt32(&mapperCanceled) != 0 {
+			if mapperCanceled.Load() != 0 {
 				return
 			}
 			if seg.Value().knownCommitted {
@@ -147,7 +149,7 @@ func (f *MemoryFile) LoadFrom(r io.Reader) error {
 		}
 	}()
 	defer func() {
-		atomic.StoreInt32(&mapperCanceled, 1)
+		mapperCanceled.Store(1)
 		<-mapperDone
 	}()
 
@@ -187,7 +189,7 @@ func (f *MemoryFile) LoadFrom(r io.Reader) error {
 		// Update accounting for restored pages. We need to do this here since
 		// these segments are marked as "known committed", and will be skipped
 		// over on accounting scans.
-		usage.MemoryAccounting.Inc(seg.End()-seg.Start(), seg.Value().kind)
+		usage.MemoryAccounting.Inc(seg.End()-seg.Start(), seg.Value().kind, seg.Value().memCgID)
 	}
 
 	return nil

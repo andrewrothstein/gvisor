@@ -17,30 +17,53 @@
 //
 // Lock order:
 //
-// pgalloc.MemoryFile.mu
-//   pgalloc.MemoryFile.mappingsMu
+//	 pgalloc.MemoryFile.mu
+//		pgalloc.MemoryFile.mappingsMu
 package pgalloc
 
 import (
 	"fmt"
 	"math"
 	"os"
-	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/context"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm"
-	"gvisor.dev/gvisor/pkg/sentry/platform"
-	"gvisor.dev/gvisor/pkg/sentry/safemem"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
-	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
-// MemoryFile is a platform.File whose pages may be allocated to arbitrary
+// Direction describes how to allocate offsets from MemoryFile.
+type Direction int
+
+const (
+	// BottomUp allocates offsets in increasing offsets.
+	BottomUp Direction = iota
+	// TopDown allocates offsets in decreasing offsets.
+	TopDown
+)
+
+// String implements fmt.Stringer.
+func (d Direction) String() string {
+	switch d {
+	case BottomUp:
+		return "up"
+	case TopDown:
+		return "down"
+	}
+	panic(fmt.Sprintf("invalid direction: %d", d))
+}
+
+// MemoryFile is a memmap.File whose pages may be allocated to arbitrary
 // users.
 type MemoryFile struct {
 	// opts holds options passed to NewMemoryFile. opts is immutable.
@@ -73,7 +96,7 @@ type MemoryFile struct {
 	// file is the backing file. The file pointer is immutable.
 	file *os.File
 
-	mu sync.Mutex
+	mu memoryFileMutex
 
 	// usage maps each page in the file to metadata for that page. Pages for
 	// which no segment exists in usage are both unallocated (not in use) and
@@ -108,12 +131,6 @@ type MemoryFile struct {
 	usageSwapped  uint64
 	usageLast     time.Time
 
-	// minUnallocatedPage is the minimum page that may be unallocated.
-	// i.e., there are no unallocated pages below minUnallocatedPage.
-	//
-	// minUnallocatedPage is protected by mu.
-	minUnallocatedPage uint64
-
 	// fileSize is the size of the backing memory file in bytes. fileSize is
 	// always a power-of-two multiple of chunkSize.
 	//
@@ -135,7 +152,7 @@ type MemoryFile struct {
 	// only requires *either* holding mappingsMu or using atomic memory
 	// operations. This allows MemoryFile.MapInternal to avoid locking in the
 	// common case where chunk mappings already exist.
-	mappingsMu sync.Mutex
+	mappingsMu mappingsMutex
 	mappings   atomic.Value
 
 	// destroyed is set by Destroy to instruct the reclaimer goroutine to
@@ -146,11 +163,9 @@ type MemoryFile struct {
 	// is protected by mu.
 	reclaimable bool
 
-	// minReclaimablePage is the minimum page that may be reclaimable.
-	// i.e., all reclaimable pages are >= minReclaimablePage.
-	//
-	// minReclaimablePage is protected by mu.
-	minReclaimablePage uint64
+	// reclaim is the collection of regions for reclaim. reclaim is protected
+	// by mu.
+	reclaim reclaimSet
 
 	// reclaimCond is signaled (with mu locked) when reclaimable or destroyed
 	// transitions from false to true.
@@ -180,6 +195,23 @@ type MemoryFileOpts struct {
 	// notifications to determine when eviction is necessary. This option has
 	// no effect unless DelayedEviction is DelayedEvictionEnabled.
 	UseHostMemcgPressure bool
+
+	// DecommitOnDestroy indicates whether the entire host file should be
+	// decommitted on destruction. This is appropriate for host filesystem based
+	// files that need to be explicitly cleaned up to release disk space.
+	DecommitOnDestroy bool
+
+	// If ManualZeroing is true, MemoryFile must not assume that new pages
+	// obtained from the host are zero-filled, such that MemoryFile must manually
+	// zero newly-allocated pages.
+	ManualZeroing bool
+
+	// If DisableIMAWorkAround is true, NewMemoryFile will not call
+	// IMAWorkAroundForMemFile().
+	DisableIMAWorkAround bool
+
+	// DiskBackedFile indicates that the MemoryFile is backed by a file on disk.
+	DiskBackedFile bool
 }
 
 // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
@@ -200,11 +232,11 @@ const (
 	// As of this writing, the behavior of DelayedEvictionEnabled depends on
 	// whether or not MemoryFileOpts.UseHostMemcgPressure is enabled:
 	//
-	// - If UseHostMemcgPressure is true, evictions are delayed until memory
-	// pressure is indicated.
+	//	- If UseHostMemcgPressure is true, evictions are delayed until memory
+	//		pressure is indicated.
 	//
-	// - Otherwise, evictions are only delayed until the reclaimer goroutine
-	// is out of work (pages to reclaim).
+	//	- Otherwise, evictions are only delayed until the reclaimer goroutine
+	//		is out of work (pages to reclaim).
 	DelayedEvictionEnabled
 
 	// DelayedEvictionManual requires that evictable allocations are only
@@ -225,6 +257,21 @@ type usageInfo struct {
 	knownCommitted bool
 
 	refs uint64
+
+	// memCgID is the memory cgroup id to which this page is committed.
+	memCgID uint32
+}
+
+// canCommit returns true if the tracked region can be committed.
+func (u *usageInfo) canCommit() bool {
+	// refs must be greater than 0 because we assume that reclaimable pages
+	// (that aren't already known to be committed) are not committed. This
+	// isn't necessarily true, even after the reclaimer does Decommit(),
+	// because the kernel may subsequently back the hugepage-sized region
+	// containing the decommitted page with a hugepage. However, it's
+	// consistent with our treatment of unallocated pages, which have the same
+	// property.
+	return !u.knownCommitted && u.refs != 0
 }
 
 // An EvictableMemoryUser represents a user of MemoryFile-allocated memory that
@@ -268,14 +315,12 @@ type evictableMemoryUserInfo struct {
 }
 
 const (
-	chunkShift = 24
-	chunkSize  = 1 << chunkShift // 16 MB
+	chunkShift = 30
+	chunkSize  = 1 << chunkShift // 1 GB
 	chunkMask  = chunkSize - 1
 
-	initialSize = chunkSize
-
 	// maxPage is the highest 64-bit page.
-	maxPage = math.MaxUint64 &^ (usermem.PageSize - 1)
+	maxPage = math.MaxUint64 &^ (hostarch.PageSize - 1)
 )
 
 // NewMemoryFile creates a MemoryFile backed by the given file. If
@@ -297,19 +342,12 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 	if err := file.Truncate(0); err != nil {
 		return nil, err
 	}
-	if err := file.Truncate(initialSize); err != nil {
-		return nil, err
-	}
 	f := &MemoryFile{
-		opts:     opts,
-		fileSize: initialSize,
-		file:     file,
-		// No pages are reclaimable. DecRef will always be able to
-		// decrease minReclaimablePage from this point.
-		minReclaimablePage: maxPage,
-		evictable:          make(map[EvictableMemoryUser]*evictableMemoryUserInfo),
+		opts:      opts,
+		file:      file,
+		evictable: make(map[EvictableMemoryUser]*evictableMemoryUserInfo),
 	}
-	f.mappings.Store(make([]uintptr, initialSize/chunkSize))
+	f.mappings.Store(make([]uintptr, 0))
 	f.reclaimCond.L = &f.mu
 
 	if f.opts.DelayedEviction == DelayedEvictionEnabled && f.opts.UseHostMemcgPressure {
@@ -329,40 +367,45 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 
 	go f.runReclaim() // S/R-SAFE: f.mu
 
-	// The Linux kernel contains an optional feature called "Integrity
-	// Measurement Architecture" (IMA). If IMA is enabled, it will checksum
-	// binaries the first time they are mapped PROT_EXEC. This is bad news for
-	// executable pages mapped from our backing file, which can grow to
-	// terabytes in (sparse) size. If IMA attempts to checksum a file that
-	// large, it will allocate all of the sparse pages and quickly exhaust all
-	// memory.
-	//
-	// Work around IMA by immediately creating a temporary PROT_EXEC mapping,
-	// while the backing file is still small. IMA will ignore any future
-	// mappings.
-	m, _, errno := syscall.Syscall6(
-		syscall.SYS_MMAP,
+	if !opts.DisableIMAWorkAround {
+		IMAWorkAroundForMemFile(file.Fd())
+	}
+	return f, nil
+}
+
+// IMAWorkAroundForMemFile works around IMA by immediately creating a temporary
+// PROT_EXEC mapping, while the backing file is still small. IMA will ignore
+// any future mappings.
+//
+// The Linux kernel contains an optional feature called "Integrity
+// Measurement Architecture" (IMA). If IMA is enabled, it will checksum
+// binaries the first time they are mapped PROT_EXEC. This is bad news for
+// executable pages mapped from our backing file, which can grow to
+// terabytes in (sparse) size. If IMA attempts to checksum a file that
+// large, it will allocate all of the sparse pages and quickly exhaust all
+// memory.
+func IMAWorkAroundForMemFile(fd uintptr) {
+	m, _, errno := unix.Syscall6(
+		unix.SYS_MMAP,
 		0,
-		usermem.PageSize,
-		syscall.PROT_EXEC,
-		syscall.MAP_SHARED,
-		file.Fd(),
+		hostarch.PageSize,
+		unix.PROT_EXEC,
+		unix.MAP_SHARED,
+		fd,
 		0)
 	if errno != 0 {
 		// This isn't fatal (IMA may not even be in use). Log the error, but
 		// don't return it.
 		log.Warningf("Failed to pre-map MemoryFile PROT_EXEC: %v", errno)
 	} else {
-		if _, _, errno := syscall.Syscall(
-			syscall.SYS_MUNMAP,
+		if _, _, errno := unix.Syscall(
+			unix.SYS_MUNMAP,
 			m,
-			usermem.PageSize,
+			hostarch.PageSize,
 			0); errno != 0 {
 			panic(fmt.Sprintf("failed to unmap PROT_EXEC MemoryFile mapping: %v", errno))
 		}
 	}
-
-	return f, nil
 }
 
 // Destroy releases all resources used by f.
@@ -377,6 +420,55 @@ func (f *MemoryFile) Destroy() {
 	f.reclaimCond.Signal()
 }
 
+// AllocationMode provides a way to inform the pgalloc API how to allocate
+// memory and pages on the host.
+// A page will exist in one of the following incremental states:
+//  1. Allocated: A page is allocated if it was returned by Allocate() and its
+//     reference count hasn't dropped to 0 since then.
+//  2. Committed: As described in MemoryFile documentation above, a page is
+//     committed if the host kernel is spending resources to store its
+//     contents. A committed page is implicitly allocated.
+//  3. Populated: A page is populated for reading/writing in a page table
+//     hierarchy if it has a page table entry that permits reading/writing
+//     respectively. A populated page is implicitly committed, since the page
+//     table entry needs a physical page to point to, but not vice versa.
+type AllocationMode int
+
+const (
+	// AllocateOnly indicates that pages need to only be allocated.
+	AllocateOnly AllocationMode = iota
+	// AllocateAndCommit indicates that pages need to be committed, in addition
+	// to being allocated.
+	AllocateAndCommit
+	// AllocateAndWritePopulate indicates that writable pages should ideally be
+	// populated in the page table, in addition to being allocated. This is a
+	// suggestion, not a requirement.
+	AllocateAndWritePopulate
+)
+
+// AllocOpts are options used in MemoryFile.Allocate.
+type AllocOpts struct {
+	// Kind is the memory kind to be used for accounting.
+	Kind usage.MemoryKind
+	// Dir indicates the direction in which offsets are allocated.
+	Dir Direction
+	// MemCgID is the memory cgroup ID and the zero value indicates that
+	// the memory will not be accounted to any cgroup.
+	MemCgID uint32
+	// Mode allows the callers to select how the pages are allocated in the
+	// MemoryFile. Callers that will fill the allocated memory by writing to it
+	// should pass AllocateAndWritePopulate to avoid faulting page-by-page. Callers
+	// that will fill the allocated memory by invoking host system calls should
+	// pass AllocateOnly.
+	Mode AllocationMode
+	// If Reader is provided, the allocated memory is filled by calling
+	// ReadToBlocks() repeatedly until either length bytes are read or a non-nil
+	// error is returned. It returns the allocated memory, truncated down to the
+	// nearest page. If this is shorter than length bytes due to an error
+	// returned by ReadToBlocks(), it returns the partially filled fr and error.
+	Reader safemem.Reader
+}
+
 // Allocate returns a range of initially-zeroed pages of the given length with
 // the given accounting kind and a single reference held by the caller. When
 // the last reference on an allocated page is released, ownership of the page
@@ -384,8 +476,65 @@ func (f *MemoryFile) Destroy() {
 // to Allocate.
 //
 // Preconditions: length must be page-aligned and non-zero.
-func (f *MemoryFile) Allocate(length uint64, kind usage.MemoryKind) (platform.FileRange, error) {
-	if length == 0 || length%usermem.PageSize != 0 {
+func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, error) {
+	fr, err := f.allocate(length, &opts)
+	if err != nil {
+		return memmap.FileRange{}, err
+	}
+	var dsts safemem.BlockSeq
+	switch opts.Mode {
+	case AllocateOnly: // Allocation is handled above. Nothing more to do.
+	case AllocateAndCommit:
+		if err := f.commitFile(fr); err != nil {
+			f.DecRef(fr)
+			return memmap.FileRange{}, err
+		}
+	case AllocateAndWritePopulate:
+		dsts, err = f.MapInternal(fr, hostarch.Write)
+		if err != nil {
+			f.DecRef(fr)
+			return memmap.FileRange{}, err
+		}
+		if canPopulate() {
+			rem := dsts
+			for {
+				if !tryPopulate(rem.Head()) {
+					break
+				}
+				rem = rem.Tail()
+				if rem.IsEmpty() {
+					break
+				}
+			}
+		}
+	default:
+		panic(fmt.Sprintf("unknown allocation mode: %d", opts.Mode))
+	}
+	if opts.Reader != nil {
+		if dsts.IsEmpty() {
+			dsts, err = f.MapInternal(fr, hostarch.Write)
+			if err != nil {
+				f.DecRef(fr)
+				return memmap.FileRange{}, err
+			}
+		}
+		n, err := safemem.ReadFullToBlocks(opts.Reader, dsts)
+		un := uint64(hostarch.Addr(n).RoundDown())
+		if un < length {
+			// Free unused memory and update fr to contain only the memory that is
+			// still allocated.
+			f.DecRef(memmap.FileRange{fr.Start + un, fr.End})
+			fr.End = fr.Start + un
+		}
+		if err != nil {
+			return fr, err
+		}
+	}
+	return fr, nil
+}
+
+func (f *MemoryFile) allocate(length uint64, opts *AllocOpts) (memmap.FileRange, error) {
+	if length == 0 || length%hostarch.PageSize != 0 {
 		panic(fmt.Sprintf("invalid allocation length: %#x", length))
 	}
 
@@ -394,122 +543,244 @@ func (f *MemoryFile) Allocate(length uint64, kind usage.MemoryKind) (platform.Fi
 
 	// Align hugepage-and-larger allocations on hugepage boundaries to try
 	// to take advantage of hugetmpfs.
-	alignment := uint64(usermem.PageSize)
-	if length >= usermem.HugePageSize {
-		alignment = usermem.HugePageSize
+	alignment := uint64(hostarch.PageSize)
+	if length >= hostarch.HugePageSize {
+		alignment = hostarch.HugePageSize
 	}
 
-	start, minUnallocatedPage := findUnallocatedRange(&f.usage, f.minUnallocatedPage, length, alignment)
-	end := start + length
-	// File offsets are int64s. Since length must be strictly positive, end
-	// cannot legitimately be 0.
-	if end < start || int64(end) <= 0 {
-		return platform.FileRange{}, syserror.ENOMEM
+	// Find a range in the underlying file.
+	fr, ok := f.findAvailableRange(length, alignment, opts.Dir)
+	if !ok {
+		return memmap.FileRange{}, linuxerr.ENOMEM
 	}
 
-	// Expand the file if needed. Double the file size on each expansion;
-	// uncommitted pages have effectively no cost.
-	fileSize := f.fileSize
-	for int64(end) > fileSize {
-		if fileSize >= 2*fileSize {
-			// fileSize overflow.
-			return platform.FileRange{}, syserror.ENOMEM
+	// Expand the file if needed.
+	if int64(fr.End) > f.fileSize {
+		// Round the new file size up to be chunk-aligned.
+		newFileSize := (int64(fr.End) + chunkMask) &^ chunkMask
+		if err := f.file.Truncate(newFileSize); err != nil {
+			return memmap.FileRange{}, err
 		}
-		fileSize *= 2
-	}
-	if fileSize > f.fileSize {
-		if err := f.file.Truncate(fileSize); err != nil {
-			return platform.FileRange{}, err
-		}
-		f.fileSize = fileSize
+		f.fileSize = newFileSize
 		f.mappingsMu.Lock()
 		oldMappings := f.mappings.Load().([]uintptr)
-		newMappings := make([]uintptr, fileSize>>chunkShift)
+		newMappings := make([]uintptr, newFileSize>>chunkShift)
 		copy(newMappings, oldMappings)
 		f.mappings.Store(newMappings)
 		f.mappingsMu.Unlock()
 	}
 
+	if f.opts.ManualZeroing {
+		if err := f.manuallyZero(fr); err != nil {
+			return memmap.FileRange{}, err
+		}
+	}
 	// Mark selected pages as in use.
-	fr := platform.FileRange{start, end}
 	if !f.usage.Add(fr, usageInfo{
-		kind: kind,
-		refs: 1,
+		kind:    opts.Kind,
+		refs:    1,
+		memCgID: opts.MemCgID,
 	}) {
 		panic(fmt.Sprintf("allocating %v: failed to insert into usage set:\n%v", fr, &f.usage))
-	}
-
-	if minUnallocatedPage < start {
-		f.minUnallocatedPage = minUnallocatedPage
-	} else {
-		// start was the first unallocated page. The next must be
-		// somewhere beyond end.
-		f.minUnallocatedPage = end
 	}
 
 	return fr, nil
 }
 
-// findUnallocatedRange returns the first unallocated page in usage of the
-// specified length and alignment beginning at page start and the first single
-// unallocated page.
-func findUnallocatedRange(usage *usageSet, start, length, alignment uint64) (uint64, uint64) {
-	// Only searched until the first page is found.
-	firstPage := start
-	foundFirstPage := false
-	alignMask := alignment - 1
-	for seg := usage.LowerBoundSegment(start); seg.Ok(); seg = seg.NextSegment() {
-		r := seg.Range()
-
-		if !foundFirstPage && r.Start > firstPage {
-			foundFirstPage = true
-		}
-
-		if start >= r.End {
-			// start was rounded up to an alignment boundary from the end
-			// of a previous segment and is now beyond r.End.
-			continue
-		}
-		// This segment represents allocated or reclaimable pages; only the
-		// range from start to the segment's beginning is allocatable, and the
-		// next allocatable range begins after the segment.
-		if r.Start > start && r.Start-start >= length {
-			break
-		}
-		start = (r.End + alignMask) &^ alignMask
-		if !foundFirstPage {
-			firstPage = r.End
-		}
+// findAvailableRange returns an available range in the usageSet.
+//
+// Note that scanning for available slots takes place from end first backwards,
+// then forwards. This heuristic has important consequence for how sequential
+// mappings can be merged in the host VMAs, given that addresses for both
+// application and sentry mappings are allocated top-down (from higher to
+// lower addresses). The file is also grown exponentially in order to create
+// space for mappings to be allocated downwards.
+//
+// Precondition: alignment must be a power of 2.
+func (f *MemoryFile) findAvailableRange(length, alignment uint64, dir Direction) (memmap.FileRange, bool) {
+	if dir == BottomUp {
+		return findAvailableRangeBottomUp(&f.usage, length, alignment)
 	}
-	return start, firstPage
+	return findAvailableRangeTopDown(&f.usage, f.fileSize, length, alignment)
 }
 
-// AllocateAndFill allocates memory of the given kind and fills it by calling
-// r.ReadToBlocks() repeatedly until either length bytes are read or a non-nil
-// error is returned. It returns the memory filled by r, truncated down to the
-// nearest page. If this is shorter than length bytes due to an error returned
-// by r.ReadToBlocks(), it returns that error.
-//
-// Preconditions: length > 0. length must be page-aligned.
-func (f *MemoryFile) AllocateAndFill(length uint64, kind usage.MemoryKind, r safemem.Reader) (platform.FileRange, error) {
-	fr, err := f.Allocate(length, kind)
-	if err != nil {
-		return platform.FileRange{}, err
+func findAvailableRangeTopDown(usage *usageSet, fileSize int64, length, alignment uint64) (memmap.FileRange, bool) {
+	alignmentMask := alignment - 1
+
+	// Search for space in existing gaps, starting at the current end of the
+	// file and working backward.
+	lastGap := usage.LastGap()
+	gap := lastGap
+	for {
+		end := gap.End()
+		if end > uint64(fileSize) {
+			end = uint64(fileSize)
+		}
+
+		// Try to allocate from the end of this gap, with the start of the
+		// allocated range aligned down to alignment.
+		unalignedStart := end - length
+		if unalignedStart > end {
+			// Negative overflow: this and all preceding gaps are too small to
+			// accommodate length.
+			break
+		}
+		if start := unalignedStart &^ alignmentMask; start >= gap.Start() {
+			return memmap.FileRange{start, start + length}, true
+		}
+
+		gap = gap.PrevLargeEnoughGap(length)
+		if !gap.Ok() {
+			break
+		}
 	}
-	dsts, err := f.MapInternal(fr, usermem.Write)
-	if err != nil {
-		f.DecRef(fr)
-		return platform.FileRange{}, err
+
+	// Check that it's possible to fit this allocation at the end of a file of any size.
+	min := lastGap.Start()
+	min = (min + alignmentMask) &^ alignmentMask
+	if min+length < min {
+		// Overflow: allocation would exceed the range of uint64.
+		return memmap.FileRange{}, false
 	}
-	n, err := safemem.ReadFullToBlocks(r, dsts)
-	un := uint64(usermem.Addr(n).RoundDown())
-	if un < length {
-		// Free unused memory and update fr to contain only the memory that is
-		// still allocated.
-		f.DecRef(platform.FileRange{fr.Start + un, fr.End})
-		fr.End = fr.Start + un
+
+	// Determine the minimum file size required to fit this allocation at its end.
+	for {
+		newFileSize := 2 * fileSize
+		if newFileSize <= fileSize {
+			if fileSize != 0 {
+				// Overflow: allocation would exceed the range of int64.
+				return memmap.FileRange{}, false
+			}
+			newFileSize = chunkSize
+		}
+		fileSize = newFileSize
+
+		unalignedStart := uint64(fileSize) - length
+		if unalignedStart > uint64(fileSize) {
+			// Negative overflow: fileSize is still inadequate.
+			continue
+		}
+		if start := unalignedStart &^ alignmentMask; start >= min {
+			return memmap.FileRange{start, start + length}, true
+		}
 	}
-	return fr, err
+}
+
+func findAvailableRangeBottomUp(usage *usageSet, length, alignment uint64) (memmap.FileRange, bool) {
+	alignmentMask := alignment - 1
+	for gap := usage.FirstGap(); gap.Ok(); gap = gap.NextLargeEnoughGap(length) {
+		// Align the start address and check if allocation still fits in the gap.
+		start := (gap.Start() + alignmentMask) &^ alignmentMask
+
+		// File offsets are int64s. Since length must be strictly positive, end
+		// cannot legitimately be 0.
+		end := start + length
+		if end < start || int64(end) <= 0 {
+			return memmap.FileRange{}, false
+		}
+		if end <= gap.End() {
+			return memmap.FileRange{start, end}, true
+		}
+	}
+
+	// NextLargeEnoughGap should have returned a gap at the end.
+	panic(fmt.Sprintf("NextLargeEnoughGap didn't return a gap at the end, length: %d", length))
+}
+
+var mlockDisabled atomicbitops.Uint32
+var madvPopulateWriteDisabled atomicbitops.Uint32
+
+func canPopulate() bool {
+	return mlockDisabled.Load() == 0 || madvPopulateWriteDisabled.Load() == 0
+}
+
+func tryPopulateMadv(b safemem.Block) bool {
+	if madvPopulateWriteDisabled.Load() != 0 {
+		return false
+	}
+	start, ok := hostarch.Addr(b.Addr()).RoundUp()
+	if !ok {
+		return true
+	}
+	end := hostarch.Addr(b.Addr() + uintptr(b.Len())).RoundDown()
+	bLen := end - start
+	// Only call madvise(MADV_POPULATE_WRITE) if >=2 pages are being populated.
+	// 1 syscall overhead >= 1 page fault overhead. This is because syscalls are
+	// susceptible to additional overheads like seccomp-bpf filters and auditing.
+	if start >= end || bLen <= hostarch.PageSize {
+		return true
+	}
+	_, _, errno := unix.RawSyscall(unix.SYS_MADVISE, uintptr(start), uintptr(bLen), unix.MADV_POPULATE_WRITE)
+	if errno != 0 {
+		if errno == unix.EINVAL {
+			// EINVAL is expected if MADV_POPULATE_WRITE is not supported (Linux <5.14).
+			log.Infof("Disabling pgalloc.MemoryFile.AllocateAndFill pre-population: madvise failed: %s", errno)
+		} else {
+			log.Warningf("Disabling pgalloc.MemoryFile.AllocateAndFill pre-population: madvise failed: %s", errno)
+		}
+		madvPopulateWriteDisabled.Store(1)
+		return false
+	}
+	return true
+}
+
+func tryPopulateMlock(b safemem.Block) bool {
+	if mlockDisabled.Load() != 0 {
+		return false
+	}
+	// Call mlock to populate pages, then munlock to cancel the mlock (but keep
+	// the pages populated). Only do so for hugepage-aligned address ranges to
+	// ensure that splitting the VMA in mlock doesn't split any existing
+	// hugepages. This assumes that two host syscalls, plus the MM overhead of
+	// mlock + munlock, is faster on average than trapping for
+	// HugePageSize/PageSize small page faults.
+	start, ok := hostarch.Addr(b.Addr()).HugeRoundUp()
+	if !ok {
+		return true
+	}
+	end := hostarch.Addr(b.Addr() + uintptr(b.Len())).HugeRoundDown()
+	if start >= end {
+		return true
+	}
+	_, _, errno := unix.Syscall(unix.SYS_MLOCK, uintptr(start), uintptr(end-start), 0)
+	unix.RawSyscall(unix.SYS_MUNLOCK, uintptr(start), uintptr(end-start), 0)
+	if errno != 0 {
+		if errno == unix.ENOMEM || errno == unix.EPERM {
+			// These errors are expected from hitting non-zero RLIMIT_MEMLOCK, or
+			// hitting zero RLIMIT_MEMLOCK without CAP_IPC_LOCK, respectively.
+			log.Infof("Disabling pgalloc.MemoryFile.AllocateAndFill pre-population: mlock failed: %s", errno)
+		} else {
+			log.Warningf("Disabling pgalloc.MemoryFile.AllocateAndFill pre-population: mlock failed: %s", errno)
+		}
+		mlockDisabled.Store(1)
+		return false
+	}
+	return true
+}
+
+func tryPopulate(b safemem.Block) bool {
+	// There are two approaches for populating writable pages:
+	// 1. madvise(MADV_POPULATE_WRITE). It has the desired effect: "Populate
+	//    (prefault) page tables writable, faulting in all pages in the range
+	//    just as if manually writing to each each page".
+	// 2. Call mlock to populate pages, then munlock to cancel the mlock (but
+	//    keep the pages populated).
+	//
+	// Prefer the madvise(MADV_POPULATE_WRITE) approach because:
+	// - Only requires 1 syscall, as opposed to 2 syscalls with mlock approach.
+	// - It is faster because it doesn't have to modify vmas like mlock does.
+	// - It works for disk-backed memory mappings too. The mlock approach doesn't
+	//   work for disk-backed filesystems (e.g. ext4). This is because
+	//   mlock(2) => mm/gup.c:__mm_populate() emulates a read fault on writable
+	//   MAP_SHARED mappings. For memory-backed (shmem) files,
+	//   mm/mmap.c:vma_set_page_prot() => vma_wants_writenotify() is false, so
+	//   the page table entries populated by a read fault are writable. For
+	//   disk-backed files, vma_set_page_prot() => vma_wants_writenotify() is
+	//   true, so the page table entries populated by a read fault are read-only.
+	if tryPopulateMadv(b) {
+		return true
+	}
+	return tryPopulateMlock(b)
 }
 
 // fallocate(2) modes, defined in Linux's include/uapi/linux/falloc.h.
@@ -523,27 +794,57 @@ const (
 // will read zeroes.
 //
 // Preconditions: fr.Length() > 0.
-func (f *MemoryFile) Decommit(fr platform.FileRange) error {
-	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%usermem.PageSize != 0 || fr.End%usermem.PageSize != 0 {
+func (f *MemoryFile) Decommit(fr memmap.FileRange) error {
+	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%hostarch.PageSize != 0 || fr.End%hostarch.PageSize != 0 {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 
-	// "After a successful call, subsequent reads from this range will
-	// return zeroes. The FALLOC_FL_PUNCH_HOLE flag must be ORed with
-	// FALLOC_FL_KEEP_SIZE in mode ..." - fallocate(2)
-	err := syscall.Fallocate(
-		int(f.file.Fd()),
-		_FALLOC_FL_PUNCH_HOLE|_FALLOC_FL_KEEP_SIZE,
-		int64(fr.Start),
-		int64(fr.Length()))
-	if err != nil {
-		return err
+	if f.opts.ManualZeroing {
+		// FALLOC_FL_PUNCH_HOLE may not zero pages if ManualZeroing is in
+		// effect.
+		if err := f.manuallyZero(fr); err != nil {
+			return err
+		}
+	} else {
+		if err := f.decommitFile(fr); err != nil {
+			return err
+		}
 	}
+
 	f.markDecommitted(fr)
 	return nil
 }
 
-func (f *MemoryFile) markDecommitted(fr platform.FileRange) {
+func (f *MemoryFile) manuallyZero(fr memmap.FileRange) error {
+	return f.forEachMappingSlice(fr, func(bs []byte) {
+		for i := range bs {
+			bs[i] = 0
+		}
+	})
+}
+
+func (f *MemoryFile) commitFile(fr memmap.FileRange) error {
+	// "The default operation (i.e., mode is zero) of fallocate() allocates the
+	// disk space within the range specified by offset and len." - fallocate(2)
+	return unix.Fallocate(
+		int(f.file.Fd()),
+		0, // mode
+		int64(fr.Start),
+		int64(fr.Length()))
+}
+
+func (f *MemoryFile) decommitFile(fr memmap.FileRange) error {
+	// "After a successful call, subsequent reads from this range will
+	// return zeroes. The FALLOC_FL_PUNCH_HOLE flag must be ORed with
+	// FALLOC_FL_KEEP_SIZE in mode ..." - fallocate(2)
+	return unix.Fallocate(
+		int(f.file.Fd()),
+		_FALLOC_FL_PUNCH_HOLE|_FALLOC_FL_KEEP_SIZE,
+		int64(fr.Start),
+		int64(fr.Length()))
+}
+
+func (f *MemoryFile) markDecommitted(fr memmap.FileRange) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// Since we're changing the knownCommitted attribute, we need to merge
@@ -553,10 +854,11 @@ func (f *MemoryFile) markDecommitted(fr platform.FileRange) {
 		if val.knownCommitted {
 			// Drop the usageExpected appropriately.
 			amount := seg.Range().Length()
-			usage.MemoryAccounting.Dec(amount, val.kind)
+			usage.MemoryAccounting.Dec(amount, val.kind, val.memCgID)
 			f.usageExpected -= amount
 			val.knownCommitted = false
 		}
+		val.memCgID = 0
 	})
 	if gap.Ok() {
 		panic(fmt.Sprintf("Decommit(%v): attempted to decommit unallocated pages %v:\n%v", fr, gap.Range(), &f.usage))
@@ -564,9 +866,9 @@ func (f *MemoryFile) markDecommitted(fr platform.FileRange) {
 	f.usage.MergeRange(fr)
 }
 
-// IncRef implements platform.File.IncRef.
-func (f *MemoryFile) IncRef(fr platform.FileRange) {
-	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%usermem.PageSize != 0 || fr.End%usermem.PageSize != 0 {
+// IncRef implements memmap.File.IncRef.
+func (f *MemoryFile) IncRef(fr memmap.FileRange, memCgID uint32) {
+	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%hostarch.PageSize != 0 || fr.End%hostarch.PageSize != 0 {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 
@@ -583,9 +885,9 @@ func (f *MemoryFile) IncRef(fr platform.FileRange) {
 	f.usage.MergeAdjacent(fr)
 }
 
-// DecRef implements platform.File.DecRef.
-func (f *MemoryFile) DecRef(fr platform.FileRange) {
-	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%usermem.PageSize != 0 || fr.End%usermem.PageSize != 0 {
+// DecRef implements memmap.File.DecRef.
+func (f *MemoryFile) DecRef(fr memmap.FileRange) {
+	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%hostarch.PageSize != 0 || fr.End%hostarch.PageSize != 0 {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 
@@ -602,11 +904,12 @@ func (f *MemoryFile) DecRef(fr platform.FileRange) {
 		}
 		val.refs--
 		if val.refs == 0 {
+			f.reclaim.Add(seg.Range(), reclaimSetValue{})
 			freed = true
 			// Reclassify memory as System, until it's freed by the reclaim
 			// goroutine.
 			if val.knownCommitted {
-				usage.MemoryAccounting.Move(seg.Range().Length(), usage.System, val.kind)
+				usage.MemoryAccounting.Move(seg.Range().Length(), usage.System, val.kind, val.memCgID)
 			}
 			val.kind = usage.System
 		}
@@ -614,22 +917,18 @@ func (f *MemoryFile) DecRef(fr platform.FileRange) {
 	f.usage.MergeAdjacent(fr)
 
 	if freed {
-		if fr.Start < f.minReclaimablePage {
-			// We've freed at least one lower page.
-			f.minReclaimablePage = fr.Start
-		}
 		f.reclaimable = true
 		f.reclaimCond.Signal()
 	}
 }
 
-// MapInternal implements platform.File.MapInternal.
-func (f *MemoryFile) MapInternal(fr platform.FileRange, at usermem.AccessType) (safemem.BlockSeq, error) {
+// MapInternal implements memmap.File.MapInternal.
+func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
 	if !fr.WellFormed() || fr.Length() == 0 {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 	if at.Execute {
-		return safemem.BlockSeq{}, syserror.EACCES
+		return safemem.BlockSeq{}, linuxerr.EACCES
 	}
 
 	chunks := ((fr.End + chunkMask) >> chunkShift) - (fr.Start >> chunkShift)
@@ -650,7 +949,7 @@ func (f *MemoryFile) MapInternal(fr platform.FileRange, at usermem.AccessType) (
 
 // forEachMappingSlice invokes fn on a sequence of byte slices that
 // collectively map all bytes in fr.
-func (f *MemoryFile) forEachMappingSlice(fr platform.FileRange, fn func([]byte)) error {
+func (f *MemoryFile) forEachMappingSlice(fr memmap.FileRange, fn func([]byte)) error {
 	mappings := f.mappings.Load().([]uintptr)
 	for chunkStart := fr.Start &^ chunkMask; chunkStart < fr.End; chunkStart += chunkSize {
 		chunk := int(chunkStart >> chunkShift)
@@ -685,12 +984,12 @@ func (f *MemoryFile) getChunkMapping(chunk int) ([]uintptr, uintptr, error) {
 	if m := mappings[chunk]; m != 0 {
 		return mappings, m, nil
 	}
-	m, _, errno := syscall.Syscall6(
-		syscall.SYS_MMAP,
+	m, _, errno := unix.Syscall6(
+		unix.SYS_MMAP,
 		0,
 		chunkSize,
-		syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_SHARED,
+		unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_SHARED,
 		f.file.Fd(),
 		uintptr(chunk<<chunkShift))
 	if errno != 0 {
@@ -812,6 +1111,11 @@ func (f *MemoryFile) UpdateUsage() error {
 		log.Debugf("UpdateUsage: skipped with usageSwapped!=0.")
 		return nil
 	}
+	// Linux updates usage values at CONFIG_HZ.
+	if scanningAfter := time.Now().Sub(f.usageLast).Milliseconds(); scanningAfter < time.Second.Milliseconds()/linux.CLOCKS_PER_SEC {
+		log.Debugf("UpdateUsage: skipped because previous scan happened %d ms back", scanningAfter)
+		return nil
+	}
 
 	f.usageLast = time.Now()
 	err = f.updateUsageLocked(currentUsage, mincore)
@@ -825,7 +1129,8 @@ func (f *MemoryFile) UpdateUsage() error {
 // pages by invoking checkCommitted, which is a function that, for each page i
 // in bs, sets committed[i] to 1 if the page is committed and 0 otherwise.
 //
-// Precondition: f.mu must be held.
+// Precondition: f.mu must be held; it may be unlocked and reacquired.
+// +checklocks:f.mu
 func (f *MemoryFile) updateUsageLocked(currentUsage uint64, checkCommitted func(bs []byte, committed []byte) error) error {
 	// Track if anything changed to elide the merge. In the common case, we
 	// expect all segments to be committed and no merge to occur.
@@ -844,17 +1149,17 @@ func (f *MemoryFile) updateUsageLocked(currentUsage uint64, checkCommitted func(
 			// that have been swapped.
 			newUsageSwapped := currentUsage - f.usageExpected
 			if f.usageSwapped < newUsageSwapped {
-				usage.MemoryAccounting.Inc(newUsageSwapped-f.usageSwapped, usage.System)
+				usage.MemoryAccounting.Inc(newUsageSwapped-f.usageSwapped, usage.System, 0)
 			} else {
-				usage.MemoryAccounting.Dec(f.usageSwapped-newUsageSwapped, usage.System)
+				usage.MemoryAccounting.Dec(f.usageSwapped-newUsageSwapped, usage.System, 0)
 			}
 			f.usageSwapped = newUsageSwapped
 		} else if f.usageSwapped != 0 {
 			// We have more usage accounted for than the file itself.
 			// That's fine, we probably caught a race where pages were
-			// being committed while the above loop was running. Just
+			// being committed while the below loop was running. Just
 			// report the higher number that we found and ignore swap.
-			usage.MemoryAccounting.Dec(f.usageSwapped, usage.System)
+			usage.MemoryAccounting.Dec(f.usageSwapped, usage.System, 0)
 			f.usageSwapped = 0
 		}
 	}()
@@ -864,21 +1169,9 @@ func (f *MemoryFile) updateUsageLocked(currentUsage uint64, checkCommitted func(
 
 	// Iterate over all usage data. There will only be usage segments
 	// present when there is an associated reference.
-	for seg := f.usage.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
-		val := seg.Value()
-
-		// Already known to be committed; ignore.
-		if val.knownCommitted {
-			continue
-		}
-
-		// Assume that reclaimable pages (that aren't already known to be
-		// committed) are not committed. This isn't necessarily true, even
-		// after the reclaimer does Decommit(), because the kernel may
-		// subsequently back the hugepage-sized region containing the
-		// decommitted page with a hugepage. However, it's consistent with our
-		// treatment of unallocated pages, which have the same property.
-		if val.refs == 0 {
+	for seg := f.usage.FirstSegment(); seg.Ok(); {
+		if !seg.ValuePtr().canCommit() {
+			seg = seg.NextSegment()
 			continue
 		}
 
@@ -887,81 +1180,82 @@ func (f *MemoryFile) updateUsageLocked(currentUsage uint64, checkCommitted func(
 		r := seg.Range()
 
 		var checkErr error
-		err := f.forEachMappingSlice(r, func(s []byte) {
-			if checkErr != nil {
-				return
-			}
-
-			// Ensure that we have sufficient buffer for the call
-			// (one byte per page). The length of each slice must
-			// be page-aligned.
-			bufLen := len(s) / usermem.PageSize
-			if len(buf) < bufLen {
-				buf = make([]byte, bufLen)
-			}
-
-			// Query for new pages in core.
-			if err := checkCommitted(s, buf); err != nil {
-				checkErr = err
-				return
-			}
-
-			// Scan each page and switch out segments.
-			populatedRun := false
-			populatedRunStart := 0
-			for i := 0; i <= bufLen; i++ {
-				// We run past the end of the slice here to
-				// simplify the logic and only set populated if
-				// we're still looking at elements.
-				populated := false
-				if i < bufLen {
-					populated = buf[i]&0x1 != 0
+		err := f.forEachMappingSlice(r,
+			func(s []byte) {
+				if checkErr != nil {
+					return
 				}
 
-				switch {
-				case populated == populatedRun:
-					// Keep the run going.
-					continue
-				case populated && !populatedRun:
-					// Begin the run.
-					populatedRun = true
-					populatedRunStart = i
-					// Keep going.
-					continue
-				case !populated && populatedRun:
-					// Finish the run by changing this segment.
-					runRange := platform.FileRange{
-						Start: r.Start + uint64(populatedRunStart*usermem.PageSize),
-						End:   r.Start + uint64(i*usermem.PageSize),
+				// Ensure that we have sufficient buffer for the call
+				// (one byte per page). The length of each slice must
+				// be page-aligned.
+				bufLen := len(s) / hostarch.PageSize
+				if len(buf) < bufLen {
+					buf = make([]byte, bufLen)
+				}
+
+				// Query for new pages in core.
+				// NOTE(b/165896008): mincore (which is passed as checkCommitted)
+				// by f.UpdateUsage() might take a really long time. So unlock f.mu
+				// while checkCommitted runs.
+				f.mu.Unlock() // +checklocksforce
+				err := checkCommitted(s, buf)
+				f.mu.Lock()
+				if err != nil {
+					checkErr = err
+					return
+				}
+
+				// Scan each page and switch out segments.
+				seg := f.usage.LowerBoundSegment(r.Start)
+				for i := 0; i < bufLen; {
+					if buf[i]&0x1 == 0 {
+						i++
+						continue
 					}
-					seg = f.usage.Isolate(seg, runRange)
-					seg.ValuePtr().knownCommitted = true
-					// Advance the segment only if we still
-					// have work to do in the context of
-					// the original segment from the for
-					// loop. Otherwise, the for loop itself
-					// will advance the segment
-					// appropriately.
-					if runRange.End != r.End {
+					// Scan to the end of this committed range.
+					j := i + 1
+					for ; j < bufLen; j++ {
+						if buf[j]&0x1 == 0 {
+							break
+						}
+					}
+					committedFR := memmap.FileRange{
+						Start: r.Start + uint64(i*hostarch.PageSize),
+						End:   r.Start + uint64(j*hostarch.PageSize),
+					}
+					// Advance seg to committedFR.Start.
+					for seg.Ok() && seg.End() < committedFR.Start {
 						seg = seg.NextSegment()
 					}
-					amount := runRange.Length()
-					usage.MemoryAccounting.Inc(amount, val.kind)
-					f.usageExpected += amount
-					changedAny = true
-					populatedRun = false
+					// Mark pages overlapping committedFR as committed.
+					for seg.Ok() && seg.Start() < committedFR.End {
+						if seg.ValuePtr().canCommit() {
+							seg = f.usage.Isolate(seg, committedFR)
+							seg.ValuePtr().knownCommitted = true
+							amount := seg.Range().Length()
+							usage.MemoryAccounting.Inc(amount, seg.ValuePtr().kind, seg.ValuePtr().memCgID)
+							f.usageExpected += amount
+							changedAny = true
+						}
+						seg = seg.NextSegment()
+					}
+					// Continue scanning for committed pages.
+					i = j + 1
 				}
-			}
 
-			// Advance r.Start.
-			r.Start += uint64(len(s))
-		})
+				// Advance r.Start.
+				r.Start += uint64(len(s))
+			})
 		if checkErr != nil {
 			return checkErr
 		}
 		if err != nil {
 			return err
 		}
+
+		// Continue with the first segment after r.End.
+		seg = f.usage.LowerBoundSegment(r.End)
 	}
 
 	return nil
@@ -974,8 +1268,8 @@ func (f *MemoryFile) TotalUsage() (uint64, error) {
 	// Stat the underlying file to discover the underlying usage. stat(2)
 	// always reports the allocated block count in units of 512 bytes. This
 	// includes pages in the page cache and swapped pages.
-	var stat syscall.Stat_t
-	if err := syscall.Fstat(int(f.file.Fd()), &stat); err != nil {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(f.file.Fd()), &stat); err != nil {
 		return 0, err
 	}
 	return uint64(stat.Blocks * 512), nil
@@ -995,9 +1289,14 @@ func (f *MemoryFile) File() *os.File {
 	return f.file
 }
 
-// FD implements platform.File.FD.
+// FD implements memmap.File.FD.
 func (f *MemoryFile) FD() int {
 	return int(f.file.Fd())
+}
+
+// IsDiskBacked returns true if f is backed by a file on disk.
+func (f *MemoryFile) IsDiskBacked() bool {
+	return f.opts.DiskBackedFile
 }
 
 // String implements fmt.Stringer.String.
@@ -1016,25 +1315,36 @@ func (f *MemoryFile) String() string {
 // for allocation.
 func (f *MemoryFile) runReclaim() {
 	for {
+		// N.B. We must call f.markReclaimed on the returned FrameRange.
 		fr, ok := f.findReclaimable()
 		if !ok {
 			break
 		}
 
-		if err := f.Decommit(fr); err != nil {
-			log.Warningf("Reclaim failed to decommit %v: %v", fr, err)
-			// Zero the pages manually. This won't reduce memory usage, but at
-			// least ensures that the pages will be zero when reallocated.
-			f.forEachMappingSlice(fr, func(bs []byte) {
-				for i := range bs {
-					bs[i] = 0
+		if f.opts.ManualZeroing {
+			// If ManualZeroing is in effect, only hugepage-aligned regions may
+			// be safely passed to decommitFile. Pages will be zeroed on
+			// reallocation, so we don't need to perform any manual zeroing
+			// here, whether or not decommitFile succeeds.
+			if startAddr, ok := hostarch.Addr(fr.Start).HugeRoundUp(); ok {
+				if endAddr := hostarch.Addr(fr.End).HugeRoundDown(); startAddr < endAddr {
+					decommitFR := memmap.FileRange{uint64(startAddr), uint64(endAddr)}
+					if err := f.decommitFile(decommitFR); err != nil {
+						log.Warningf("Reclaim failed to decommit %v: %v", decommitFR, err)
+					}
 				}
-			})
-			// Pretend the pages were decommitted even though they weren't,
-			// since the memory accounting implementation has no idea how to
-			// deal with this.
-			f.markDecommitted(fr)
+			}
+		} else {
+			if err := f.decommitFile(fr); err != nil {
+				log.Warningf("Reclaim failed to decommit %v: %v", fr, err)
+				// Zero the pages manually. This won't reduce memory usage, but at
+				// least ensures that the pages will be zero when reallocated.
+				if err := f.manuallyZero(fr); err != nil {
+					panic(fmt.Sprintf("Reclaim failed to decommit or zero %v: %v", fr, err))
+				}
+			}
 		}
+		f.markDecommitted(fr)
 		f.markReclaimed(fr)
 	}
 
@@ -1045,6 +1355,12 @@ func (f *MemoryFile) runReclaim() {
 		f.mu.Unlock()
 		panic("findReclaimable broke out of reclaim loop, but destroyed is no longer set")
 	}
+	if f.opts.DecommitOnDestroy && f.fileSize > 0 {
+		if err := f.decommitFile(memmap.FileRange{Start: 0, End: uint64(f.fileSize)}); err != nil {
+			f.mu.Unlock()
+			panic(fmt.Sprintf("failed to decommit entire memory file during destruction: %v", err))
+		}
+	}
 	f.file.Close()
 	// Ensure that any attempts to use f.file.Fd() fail instead of getting a fd
 	// that has possibly been reassigned.
@@ -1054,7 +1370,7 @@ func (f *MemoryFile) runReclaim() {
 	mappings := f.mappings.Load().([]uintptr)
 	for i, m := range mappings {
 		if m != 0 {
-			_, _, errno := syscall.Syscall(syscall.SYS_MUNMAP, m, chunkSize, 0)
+			_, _, errno := unix.Syscall(unix.SYS_MUNMAP, m, chunkSize, 0)
 			if errno != 0 {
 				log.Warningf("Failed to unmap mapping %#x for MemoryFile chunk %d: %v", m, i, errno)
 			}
@@ -1071,13 +1387,17 @@ func (f *MemoryFile) runReclaim() {
 	}
 }
 
-func (f *MemoryFile) findReclaimable() (platform.FileRange, bool) {
+// findReclaimable finds memory that has been marked for reclaim.
+//
+// Note that there returned range will be removed from tracking. It
+// must be reclaimed (removed from f.usage) at this point.
+func (f *MemoryFile) findReclaimable() (memmap.FileRange, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for {
 		for {
 			if f.destroyed {
-				return platform.FileRange{}, false
+				return memmap.FileRange{}, false
 			}
 			if f.reclaimable {
 				break
@@ -1089,27 +1409,25 @@ func (f *MemoryFile) findReclaimable() (platform.FileRange, bool) {
 			}
 			f.reclaimCond.Wait()
 		}
-		// Allocate returns the first usable range in offset order and is
-		// currently a linear scan, so reclaiming from the beginning of the
-		// file minimizes the expected latency of Allocate.
-		for seg := f.usage.LowerBoundSegment(f.minReclaimablePage); seg.Ok(); seg = seg.NextSegment() {
-			if seg.ValuePtr().refs == 0 {
-				f.minReclaimablePage = seg.End()
-				return seg.Range(), true
-			}
+		// Most allocations are done upwards, with exceptions being stacks and some
+		// allocators that allocate top-down. Reclaim preserves this order to
+		// minimize the cost of the search.
+		if seg := f.reclaim.FirstSegment(); seg.Ok() {
+			fr := seg.Range()
+			f.reclaim.Remove(seg)
+			return fr, true
 		}
-		// No pages are reclaimable.
+		// Nothing is reclaimable.
 		f.reclaimable = false
-		f.minReclaimablePage = maxPage
 	}
 }
 
-func (f *MemoryFile) markReclaimed(fr platform.FileRange) {
+func (f *MemoryFile) markReclaimed(fr memmap.FileRange) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	seg := f.usage.FindSegment(fr.Start)
-	// All of fr should be mapped to a single uncommitted reclaimable segment
-	// accounted to System.
+	// All of fr should be mapped to a single uncommitted reclaimable
+	// segment accounted to System.
 	if !seg.Ok() {
 		panic(fmt.Sprintf("reclaimed pages %v include unreferenced pages:\n%v", fr, &f.usage))
 	}
@@ -1120,17 +1438,14 @@ func (f *MemoryFile) markReclaimed(fr platform.FileRange) {
 		kind:           usage.System,
 		knownCommitted: false,
 		refs:           0,
+		memCgID:        0,
 	}); got != want {
 		panic(fmt.Sprintf("reclaimed pages %v in segment %v has incorrect state %v, wanted %v:\n%v", fr, seg.Range(), got, want, &f.usage))
 	}
-	// Deallocate reclaimed pages. Even though all of seg is reclaimable, the
-	// caller of markReclaimed may not have decommitted it, so we can only mark
-	// fr as reclaimed.
+	// Deallocate reclaimed pages. Even though all of seg is reclaimable,
+	// the caller of markReclaimed may not have decommitted it, so we can
+	// only mark fr as reclaimed.
 	f.usage.Remove(f.usage.Isolate(seg, fr))
-	if fr.Start < f.minUnallocatedPage {
-		// We've deallocated at least one lower page.
-		f.minUnallocatedPage = fr.Start
-	}
 }
 
 // StartEvictions requests that f evict all evictable allocations. It does not
@@ -1155,8 +1470,10 @@ func (f *MemoryFile) startEvictionsLocked() bool {
 	return startedAny
 }
 
-// Preconditions: info == f.evictable[user]. !info.evicting. f.mu must be
-// locked.
+// Preconditions:
+//   - info == f.evictable[user].
+//   - !info.evicting.
+//   - f.mu must be locked.
 func (f *MemoryFile) startEvictionGoroutineLocked(user EvictableMemoryUser, info *evictableMemoryUserInfo) {
 	info.evicting = true
 	f.evictionWG.Add(1)
@@ -1210,11 +1527,11 @@ func (usageSetFunctions) MaxKey() uint64 {
 func (usageSetFunctions) ClearValue(val *usageInfo) {
 }
 
-func (usageSetFunctions) Merge(_ platform.FileRange, val1 usageInfo, _ platform.FileRange, val2 usageInfo) (usageInfo, bool) {
+func (usageSetFunctions) Merge(_ memmap.FileRange, val1 usageInfo, _ memmap.FileRange, val2 usageInfo) (usageInfo, bool) {
 	return val1, val1 == val2
 }
 
-func (usageSetFunctions) Split(_ platform.FileRange, val usageInfo, _ uint64) (usageInfo, usageInfo) {
+func (usageSetFunctions) Split(_ memmap.FileRange, val usageInfo, _ uint64) (usageInfo, usageInfo) {
 	return val, val
 }
 
@@ -1240,4 +1557,28 @@ func (evictableRangeSetFunctions) Merge(_ EvictableRange, _ evictableRangeSetVal
 
 func (evictableRangeSetFunctions) Split(_ EvictableRange, _ evictableRangeSetValue, _ uint64) (evictableRangeSetValue, evictableRangeSetValue) {
 	return evictableRangeSetValue{}, evictableRangeSetValue{}
+}
+
+// reclaimSetValue is the value type of reclaimSet.
+type reclaimSetValue struct{}
+
+type reclaimSetFunctions struct{}
+
+func (reclaimSetFunctions) MinKey() uint64 {
+	return 0
+}
+
+func (reclaimSetFunctions) MaxKey() uint64 {
+	return math.MaxUint64
+}
+
+func (reclaimSetFunctions) ClearValue(val *reclaimSetValue) {
+}
+
+func (reclaimSetFunctions) Merge(_ memmap.FileRange, _ reclaimSetValue, _ memmap.FileRange, _ reclaimSetValue) (reclaimSetValue, bool) {
+	return reclaimSetValue{}, true
+}
+
+func (reclaimSetFunctions) Split(_ memmap.FileRange, _ reclaimSetValue, _ uint64) (reclaimSetValue, reclaimSetValue) {
+	return reclaimSetValue{}, reclaimSetValue{}
 }

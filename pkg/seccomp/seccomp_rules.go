@@ -14,15 +14,20 @@
 
 package seccomp
 
-import "fmt"
+import (
+	"fmt"
+
+	"golang.org/x/sys/unix"
+)
 
 // The offsets are based on the following struct in include/linux/seccomp.h.
-// struct seccomp_data {
-//	int nr;
-//	__u32 arch;
-//	__u64 instruction_pointer;
-//	__u64 args[6];
-// };
+//
+//	struct seccomp_data {
+//		int nr;
+//		__u32 arch;
+//		__u64 instruction_pointer;
+//		__u64 args[6];
+//	};
 const (
 	seccompDataOffsetNR     = 0
 	seccompDataOffsetArch   = 4
@@ -39,27 +44,86 @@ func seccompDataOffsetArgHigh(i int) uint32 {
 	return seccompDataOffsetArgLow(i) + 4
 }
 
-// AllowAny is marker to indicate any value will be accepted.
-type AllowAny struct{}
+// MatchAny is marker to indicate any value will be accepted.
+type MatchAny struct{}
 
-func (a AllowAny) String() (s string) {
+func (a MatchAny) String() (s string) {
 	return "*"
 }
 
-// AllowValue specifies a value that needs to be strictly matched.
-type AllowValue uintptr
+// EqualTo specifies a value that needs to be strictly matched.
+type EqualTo uintptr
 
-func (a AllowValue) String() (s string) {
-	return fmt.Sprintf("%#x ", uintptr(a))
+func (a EqualTo) String() (s string) {
+	return fmt.Sprintf("== %#x", uintptr(a))
 }
 
-// Rule stores the whitelist of syscall arguments.
+// NotEqual specifies a value that is strictly not equal.
+type NotEqual uintptr
+
+func (a NotEqual) String() (s string) {
+	return fmt.Sprintf("!= %#x", uintptr(a))
+}
+
+// GreaterThan specifies a value that needs to be strictly smaller.
+type GreaterThan uintptr
+
+func (a GreaterThan) String() (s string) {
+	return fmt.Sprintf("> %#x", uintptr(a))
+}
+
+// GreaterThanOrEqual specifies a value that needs to be smaller or equal.
+type GreaterThanOrEqual uintptr
+
+func (a GreaterThanOrEqual) String() (s string) {
+	return fmt.Sprintf(">= %#x", uintptr(a))
+}
+
+// LessThan specifies a value that needs to be strictly greater.
+type LessThan uintptr
+
+func (a LessThan) String() (s string) {
+	return fmt.Sprintf("< %#x", uintptr(a))
+}
+
+// LessThanOrEqual specifies a value that needs to be greater or equal.
+type LessThanOrEqual uintptr
+
+func (a LessThanOrEqual) String() (s string) {
+	return fmt.Sprintf("<= %#x", uintptr(a))
+}
+
+type maskedEqual struct {
+	mask  uintptr
+	value uintptr
+}
+
+func (a maskedEqual) String() (s string) {
+	return fmt.Sprintf("& %#x == %#x", a.mask, a.value)
+}
+
+// MaskedEqual specifies a value that matches the input after the input is
+// masked (bitwise &) against the given mask. Can be used to verify that input
+// only includes certain approved flags.
+func MaskedEqual(mask, value uintptr) any {
+	return maskedEqual{
+		mask:  mask,
+		value: value,
+	}
+}
+
+// Rule stores the allowed syscall arguments.
 //
 // For example:
-// rule := Rule {
-//       AllowValue(linux.ARCH_GET_FS | linux.ARCH_SET_FS), // arg0
-// }
-type Rule [6]interface{}
+//
+//	rule := Rule {
+//		EqualTo(linux.ARCH_GET_FS | linux.ARCH_SET_FS), // arg0
+//	}
+type Rule [7]any // 6 arguments + RIP
+
+// RuleIP indicates what rules in the Rule array have to be applied to
+// instruction pointer.
+const RuleIP = 6
 
 func (r Rule) String() (s string) {
 	if len(r) == 0 {
@@ -75,22 +139,24 @@ func (r Rule) String() (s string) {
 	return
 }
 
-// SyscallRules stores a map of OR'ed whitelist rules indexed by the syscall number.
+// SyscallRules stores a map of OR'ed argument rules indexed by the syscall number.
 // If the 'Rules' is empty, we treat it as any argument is allowed.
 //
 // For example:
-//  rules := SyscallRules{
-//         syscall.SYS_FUTEX: []Rule{
-//                 {
-//                         AllowAny{},
-//                         AllowValue(linux.FUTEX_WAIT | linux.FUTEX_PRIVATE_FLAG),
-//                 }, // OR
-//                 {
-//                         AllowAny{},
-//                         AllowValue(linux.FUTEX_WAKE | linux.FUTEX_PRIVATE_FLAG),
-//                 },
-//         },
-//         syscall.SYS_GETPID: []Rule{},
+//
+//	rules := SyscallRules{
+//	       syscall.SYS_FUTEX: []Rule{
+//	               {
+//	                       MatchAny{},
+//	                       EqualTo(linux.FUTEX_WAIT | linux.FUTEX_PRIVATE_FLAG),
+//	               }, // OR
+//	               {
+//	                       MatchAny{},
+//	                       EqualTo(linux.FUTEX_WAKE | linux.FUTEX_PRIVATE_FLAG),
+//	               },
+//	       },
+//	       syscall.SYS_GETPID: []Rule{},
+//
 // }
 type SyscallRules map[uintptr][]Rule
 
@@ -129,4 +195,23 @@ func (sr SyscallRules) Merge(rules SyscallRules) {
 			sr[sysno] = rs
 		}
 	}
+}
+
+// DenyNewExecMappings is a set of rules that denies creating new executable
+// mappings and converting existing ones.
+var DenyNewExecMappings = SyscallRules{
+	unix.SYS_MMAP: []Rule{
+		{
+			MatchAny{},
+			MatchAny{},
+			MaskedEqual(unix.PROT_EXEC, unix.PROT_EXEC),
+		},
+	},
+	unix.SYS_MPROTECT: []Rule{
+		{
+			MatchAny{},
+			MatchAny{},
+			MaskedEqual(unix.PROT_EXEC, unix.PROT_EXEC),
+		},
+	},
 }

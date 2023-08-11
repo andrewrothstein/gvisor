@@ -13,7 +13,8 @@
 // limitations under the License.
 
 // Package compressio provides parallel compression and decompression, as well
-// as optional SHA-256 hashing.
+// as optional SHA-256 hashing. It also provides another storage variant
+// (nocompressio) that does not compress data but tracks its integrity.
 //
 // The stream format is defined as follows.
 //
@@ -35,9 +36,9 @@
 //
 // where each subsequent hash is calculated from the following items in order
 //
-//     compressed data
-//     compressed data size
-//     previous hash
+//	compressed data
+//	compressed data size
+//	previous hash
 //
 // so the stream integrity cannot be compromised by switching and mixing
 // compressed chunks.
@@ -48,23 +49,23 @@ import (
 	"compress/flate"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"hash"
 	"io"
 	"runtime"
-	"sync"
 
-	"gvisor.dev/gvisor/pkg/binary"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 var bufPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return bytes.NewBuffer(nil)
 	},
 }
 
 var chunkPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(chunk)
 	},
 }
@@ -130,6 +131,10 @@ type worker struct {
 	hashPool *hashPool
 	input    chan *chunk
 	output   chan result
+
+	// scratch is a temporary buffer used for marshalling. This is declared
+	// unfront here to avoid reallocation.
+	scratch [4]byte
 }
 
 // work is the main work routine; see worker.
@@ -167,7 +172,8 @@ func (w *worker) work(compress bool, level int) {
 
 			// Write the hash, if enabled.
 			if h != nil {
-				binary.WriteUint32(h, binary.BigEndian, uint32(c.compressed.Len()))
+				binary.BigEndian.PutUint32(w.scratch[:], uint32(c.compressed.Len()))
+				h.Write(w.scratch[:4])
 				c.h = h
 				h = nil
 			}
@@ -175,7 +181,8 @@ func (w *worker) work(compress bool, level int) {
 			// Check the hash of the compressed contents.
 			if h != nil {
 				h.Write(c.compressed.Bytes())
-				binary.WriteUint32(h, binary.BigEndian, uint32(c.compressed.Len()))
+				binary.BigEndian.PutUint32(w.scratch[:], uint32(c.compressed.Len()))
+				h.Write(w.scratch[:4])
 				io.CopyN(h, bytes.NewReader(c.lastSum), int64(len(c.lastSum)))
 
 				sum := h.Sum(nil)
@@ -346,34 +353,41 @@ func (p *pool) schedule(c *chunk, callback func(*chunk) error) error {
 	}
 }
 
-// reader chunks reads and decompresses.
-type reader struct {
+// Reader is a compressed reader.
+type Reader struct {
 	pool
 
 	// in is the source.
 	in io.Reader
+
+	// scratch is a temporary buffer used for marshalling. This is declared
+	// unfront here to avoid reallocation.
+	scratch [4]byte
 }
+
+var _ io.Reader = (*Reader)(nil)
 
 // NewReader returns a new compressed reader. If key is non-nil, the data stream
 // is assumed to contain expected hash values, which will be compared against
 // hash values computed from the compressed bytes. See package comments for
 // details.
-func NewReader(in io.Reader, key []byte) (io.Reader, error) {
-	r := &reader{
+func NewReader(in io.Reader, key []byte) (*Reader, error) {
+	r := &Reader{
 		in: in,
 	}
 
 	// Use double buffering for read.
 	r.init(key, 2*runtime.GOMAXPROCS(0), false, 0)
 
-	var err error
-	if r.chunkSize, err = binary.ReadUint32(in, binary.BigEndian); err != nil {
+	if _, err := io.ReadFull(in, r.scratch[:4]); err != nil {
 		return nil, err
 	}
+	r.chunkSize = binary.BigEndian.Uint32(r.scratch[:4])
 
 	if r.hashPool != nil {
 		h := r.hashPool.getHash()
-		binary.WriteUint32(h, binary.BigEndian, r.chunkSize)
+		binary.BigEndian.PutUint32(r.scratch[:], r.chunkSize)
+		h.Write(r.scratch[:4])
 		r.lastSum = h.Sum(nil)
 		r.hashPool.putHash(h)
 		sum := make([]byte, len(r.lastSum))
@@ -394,8 +408,19 @@ var errNewBuffer = errors.New("buffer ready")
 // ErrHashMismatch is returned if the hash does not match.
 var ErrHashMismatch = errors.New("hash mismatch")
 
+// ReadByte implements wire.Reader.ReadByte.
+func (r *Reader) ReadByte() (byte, error) {
+	var p [1]byte
+	n, err := r.Read(p[:])
+	if n != 1 {
+		return p[0], err
+	}
+	// Suppress EOF.
+	return p[0], nil
+}
+
 // Read implements io.Reader.Read.
-func (r *reader) Read(p []byte) (int, error) {
+func (r *Reader) Read(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -454,8 +479,7 @@ func (r *reader) Read(p []byte) (int, error) {
 		// reader. The length is used to limit the reader.
 		//
 		// See writer.flush.
-		l, err := binary.ReadUint32(r.in, binary.BigEndian)
-		if err != nil {
+		if _, err := io.ReadFull(r.in, r.scratch[:4]); err != nil {
 			// This is generally okay as long as there
 			// are still buffers outstanding. We actually
 			// just wait for completion of those buffers here
@@ -475,6 +499,7 @@ func (r *reader) Read(p []byte) (int, error) {
 				return done, err
 			}
 		}
+		l := binary.BigEndian.Uint32(r.scratch[:4])
 
 		// Read this chunk and schedule decompression.
 		compressed := bufPool.Get().(*bytes.Buffer)
@@ -551,8 +576,8 @@ func (r *reader) Read(p []byte) (int, error) {
 	return done, nil
 }
 
-// writer chunks and schedules writes.
-type writer struct {
+// Writer is a compressed writer.
+type Writer struct {
 	pool
 
 	// out is the underlying writer.
@@ -560,7 +585,13 @@ type writer struct {
 
 	// closed indicates whether the file has been closed.
 	closed bool
+
+	// scratch is a temporary buffer used for marshalling. This is declared
+	// unfront here to avoid reallocation.
+	scratch [4]byte
 }
+
+var _ io.Writer = (*Writer)(nil)
 
 // NewWriter returns a new compressed writer. If key is non-nil, hash values are
 // generated and written out for compressed bytes. See package comments for
@@ -569,8 +600,8 @@ type writer struct {
 // The recommended chunkSize is on the order of 1M. Extra memory may be
 // buffered (in the form of read-ahead, or buffered writes), and is limited to
 // O(chunkSize * [1+GOMAXPROCS]).
-func NewWriter(out io.Writer, key []byte, chunkSize uint32, level int) (io.WriteCloser, error) {
-	w := &writer{
+func NewWriter(out io.Writer, key []byte, chunkSize uint32, level int) (*Writer, error) {
+	w := &Writer{
 		pool: pool{
 			chunkSize: chunkSize,
 			buf:       bufPool.Get().(*bytes.Buffer),
@@ -579,13 +610,15 @@ func NewWriter(out io.Writer, key []byte, chunkSize uint32, level int) (io.Write
 	}
 	w.init(key, 1+runtime.GOMAXPROCS(0), true, level)
 
-	if err := binary.WriteUint32(w.out, binary.BigEndian, chunkSize); err != nil {
+	binary.BigEndian.PutUint32(w.scratch[:], chunkSize)
+	if _, err := w.out.Write(w.scratch[:4]); err != nil {
 		return nil, err
 	}
 
 	if w.hashPool != nil {
 		h := w.hashPool.getHash()
-		binary.WriteUint32(h, binary.BigEndian, chunkSize)
+		binary.BigEndian.PutUint32(w.scratch[:], chunkSize)
+		h.Write(w.scratch[:4])
 		w.lastSum = h.Sum(nil)
 		w.hashPool.putHash(h)
 		if _, err := io.CopyN(w.out, bytes.NewReader(w.lastSum), int64(len(w.lastSum))); err != nil {
@@ -597,11 +630,13 @@ func NewWriter(out io.Writer, key []byte, chunkSize uint32, level int) (io.Write
 }
 
 // flush writes a single buffer.
-func (w *writer) flush(c *chunk) error {
+func (w *Writer) flush(c *chunk) error {
 	// Prefix each chunk with a length; this allows the reader to safely
 	// limit reads while buffering.
 	l := uint32(c.compressed.Len())
-	if err := binary.WriteUint32(w.out, binary.BigEndian, l); err != nil {
+
+	binary.BigEndian.PutUint32(w.scratch[:], l)
+	if _, err := w.out.Write(w.scratch[:4]); err != nil {
 		return err
 	}
 
@@ -624,8 +659,23 @@ func (w *writer) flush(c *chunk) error {
 	return nil
 }
 
+// WriteByte implements wire.Writer.WriteByte.
+//
+// Note that this implementation is necessary on the object itself, as an
+// interface-based dispatch cannot tell whether the array backing the slice
+// escapes, therefore the all bytes written will generate an escape.
+func (w *Writer) WriteByte(b byte) error {
+	var p [1]byte
+	p[0] = b
+	n, err := w.Write(p[:])
+	if n != 1 {
+		return err
+	}
+	return nil
+}
+
 // Write implements io.Writer.Write.
-func (w *writer) Write(p []byte) (int, error) {
+func (w *Writer) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -710,7 +760,7 @@ func (w *writer) Write(p []byte) (int, error) {
 }
 
 // Close implements io.Closer.Close.
-func (w *writer) Close() error {
+func (w *Writer) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 

@@ -15,78 +15,45 @@
 package raw
 
 import (
+	"fmt"
+	"time"
+
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
-// saveData saves packet.data field.
-func (p *packet) saveData() buffer.VectorisedView {
-	// We cannot save p.data directly as p.data.views may alias to p.views,
-	// which is not allowed by state framework (in-struct pointer).
-	return p.data.Clone(nil)
+// saveReceivedAt is invoked by stateify.
+func (p *rawPacket) saveReceivedAt() int64 {
+	return p.receivedAt.UnixNano()
 }
 
-// loadData loads packet.data field.
-func (p *packet) loadData(data buffer.VectorisedView) {
-	// NOTE: We cannot do the p.data = data.Clone(p.views[:]) optimization
-	// here because data.views is not guaranteed to be loaded by now. Plus,
-	// data.views will be allocated anyway so there really is little point
-	// of utilizing p.views for data.views.
-	p.data = data
-}
-
-// beforeSave is invoked by stateify.
-func (ep *endpoint) beforeSave() {
-	// Stop incoming packets from being handled (and mutate endpoint state).
-	// The lock will be released after saveRcvBufSizeMax(), which would have
-	// saved ep.rcvBufSizeMax and set it to 0 to continue blocking incoming
-	// packets.
-	ep.rcvMu.Lock()
-}
-
-// saveRcvBufSizeMax is invoked by stateify.
-func (ep *endpoint) saveRcvBufSizeMax() int {
-	max := ep.rcvBufSizeMax
-	// Make sure no new packets will be handled regardless of the lock.
-	ep.rcvBufSizeMax = 0
-	// Release the lock acquired in beforeSave() so regular endpoint closing
-	// logic can proceed after save.
-	ep.rcvMu.Unlock()
-	return max
-}
-
-// loadRcvBufSizeMax is invoked by stateify.
-func (ep *endpoint) loadRcvBufSizeMax(max int) {
-	ep.rcvBufSizeMax = max
+// loadReceivedAt is invoked by stateify.
+func (p *rawPacket) loadReceivedAt(nsec int64) {
+	p.receivedAt = time.Unix(0, nsec)
 }
 
 // afterLoad is invoked by stateify.
-func (ep *endpoint) afterLoad() {
-	stack.StackFromEnv.RegisterRestoredEndpoint(ep)
+func (e *endpoint) afterLoad() {
+	stack.StackFromEnv.RegisterRestoredEndpoint(e)
+}
+
+// beforeSave is invoked by stateify.
+func (e *endpoint) beforeSave() {
+	e.setReceiveDisabled(true)
 }
 
 // Resume implements tcpip.ResumableEndpoint.Resume.
-func (ep *endpoint) Resume(s *stack.Stack) {
-	ep.stack = s
+func (e *endpoint) Resume(s *stack.Stack) {
+	e.net.Resume(s)
 
-	// If the endpoint is connected, re-connect.
-	if ep.connected {
-		var err *tcpip.Error
-		ep.route, err = ep.stack.FindRoute(ep.registeredNIC, ep.boundAddr, ep.route.RemoteAddress, ep.netProto, false)
-		if err != nil {
-			panic(err)
+	e.setReceiveDisabled(false)
+	e.stack = s
+	e.ops.InitHandler(e, e.stack, tcpip.GetStackSendBufferLimits, tcpip.GetStackReceiveBufferLimits)
+
+	if e.associated {
+		netProto := e.net.NetProto()
+		if err := e.stack.RegisterRawTransportEndpoint(netProto, e.transProto, e); err != nil {
+			panic(fmt.Sprintf("e.stack.RegisterRawTransportEndpoint(%d, %d, _): %s", netProto, e.transProto, err))
 		}
-	}
-
-	// If the endpoint is bound, re-bind.
-	if ep.bound {
-		if ep.stack.CheckLocalAddress(ep.registeredNIC, ep.netProto, ep.boundAddr) == 0 {
-			panic(tcpip.ErrBadLocalAddress)
-		}
-	}
-
-	if err := ep.stack.RegisterRawTransportEndpoint(ep.registeredNIC, ep.netProto, ep.transProto, ep); err != nil {
-		panic(err)
 	}
 }

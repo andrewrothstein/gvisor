@@ -18,9 +18,8 @@ import (
 	"math"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 // IntervalTimer represents a POSIX interval timer as described by
@@ -97,7 +96,7 @@ func (it *IntervalTimer) ResumeTimer() {
 }
 
 // Preconditions: it.target's signal mutex must be locked.
-func (it *IntervalTimer) updateDequeuedSignalLocked(si *arch.SignalInfo) {
+func (it *IntervalTimer) updateDequeuedSignalLocked(si *linux.SignalInfo) {
 	it.sigpending = false
 	if it.sigorphan {
 		return
@@ -116,10 +115,10 @@ func (it *IntervalTimer) signalRejectedLocked() {
 	it.overrunCur++
 }
 
-// Notify implements ktime.TimerListener.Notify.
-func (it *IntervalTimer) Notify(exp uint64) {
+// NotifyTimer implements ktime.TimerListener.NotifyTimer.
+func (it *IntervalTimer) NotifyTimer(exp uint64, setting ktime.Setting) (ktime.Setting, bool) {
 	if it.target == nil {
-		return
+		return ktime.Setting{}, false
 	}
 
 	it.target.tg.pidns.owner.mu.RLock()
@@ -129,7 +128,7 @@ func (it *IntervalTimer) Notify(exp uint64) {
 
 	if it.sigpending {
 		it.overrunCur += exp
-		return
+		return ktime.Setting{}, false
 	}
 
 	// sigpending must be set before sendSignalTimerLocked() so that it can be
@@ -138,9 +137,9 @@ func (it *IntervalTimer) Notify(exp uint64) {
 	it.sigpending = true
 	it.sigorphan = false
 	it.overrunCur += exp - 1
-	si := &arch.SignalInfo{
+	si := &linux.SignalInfo{
 		Signo: int32(it.signo),
-		Code:  arch.SignalInfoTimer,
+		Code:  linux.SI_TIMER,
 	}
 	si.SetTimerID(it.id)
 	si.SetSigval(it.sigval)
@@ -148,11 +147,8 @@ func (it *IntervalTimer) Notify(exp uint64) {
 	if err := it.target.sendSignalTimerLocked(si, it.group, it); err != nil {
 		it.signalRejectedLocked()
 	}
-}
 
-// Destroy implements ktime.TimerListener.Destroy. Users of Timer should call
-// DestroyTimer instead.
-func (it *IntervalTimer) Destroy() {
+	return ktime.Setting{}, false
 }
 
 // IntervalTimerCreate implements timer_create(2).
@@ -174,7 +170,7 @@ func (t *Task) IntervalTimerCreate(c ktime.Clock, sigev *linux.Sigevent) (linux.
 			break
 		}
 		if t.tg.nextTimerID == end {
-			return 0, syserror.EAGAIN
+			return 0, linuxerr.EAGAIN
 		}
 	}
 
@@ -213,16 +209,16 @@ func (t *Task) IntervalTimerCreate(c ktime.Clock, sigev *linux.Sigevent) (linux.
 		target, ok := t.tg.pidns.tasks[ThreadID(sigev.Tid)]
 		t.tg.pidns.owner.mu.RUnlock()
 		if !ok || target.tg != t.tg {
-			return 0, syserror.EINVAL
+			return 0, linuxerr.EINVAL
 		}
 		it.target = target
 	default:
-		return 0, syserror.EINVAL
+		return 0, linuxerr.EINVAL
 	}
 	if sigev.Notify != linux.SIGEV_NONE {
 		it.signo = linux.Signal(sigev.Signo)
 		if !it.signo.IsValid() {
-			return 0, syserror.EINVAL
+			return 0, linuxerr.EINVAL
 		}
 	}
 	it.timer = ktime.NewTimer(c, it)
@@ -237,7 +233,7 @@ func (t *Task) IntervalTimerDelete(id linux.TimerID) error {
 	defer t.tg.timerMu.Unlock()
 	it := t.tg.timers[id]
 	if it == nil {
-		return syserror.EINVAL
+		return linuxerr.EINVAL
 	}
 	delete(t.tg.timers, id)
 	it.DestroyTimer()
@@ -250,7 +246,7 @@ func (t *Task) IntervalTimerSettime(id linux.TimerID, its linux.Itimerspec, abs 
 	defer t.tg.timerMu.Unlock()
 	it := t.tg.timers[id]
 	if it == nil {
-		return linux.Itimerspec{}, syserror.EINVAL
+		return linux.Itimerspec{}, linuxerr.EINVAL
 	}
 
 	newS, err := ktime.SettingFromItimerspec(its, abs, it.timer.Clock())
@@ -268,7 +264,7 @@ func (t *Task) IntervalTimerGettime(id linux.TimerID) (linux.Itimerspec, error) 
 	defer t.tg.timerMu.Unlock()
 	it := t.tg.timers[id]
 	if it == nil {
-		return linux.Itimerspec{}, syserror.EINVAL
+		return linux.Itimerspec{}, linuxerr.EINVAL
 	}
 
 	tm, s := it.timer.Get()
@@ -284,7 +280,7 @@ func (t *Task) IntervalTimerGetoverrun(id linux.TimerID) (int32, error) {
 	defer t.tg.timerMu.Unlock()
 	it := t.tg.timers[id]
 	if it == nil {
-		return 0, syserror.EINVAL
+		return 0, linuxerr.EINVAL
 	}
 	// By timer_create(2) invariant, either it.target == nil (in which case
 	// it.overrunLast is immutably 0) or t.tg == it.target.tg; and the fact

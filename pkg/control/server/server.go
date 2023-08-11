@@ -22,9 +22,10 @@ package server
 
 import (
 	"os"
-	"sync"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/urpc"
 )
@@ -65,12 +66,13 @@ func (s *Server) Wait() {
 
 // Stop stops the server. Note that this function should only be called once
 // and the server should not be used afterwards.
-func (s *Server) Stop() {
+func (s *Server) Stop(timeout time.Duration) {
 	s.socket.Close()
-	s.wg.Wait()
+	s.Wait()
 
-	// This will cause existing clients to be terminated safely.
-	s.server.Stop()
+	// This will cause existing clients to be terminated safely. If the
+	// registered handlers have a Stop callback, it will be called.
+	s.server.Stop(timeout)
 }
 
 // StartServing starts listening for connect and spawns the main service
@@ -122,7 +124,7 @@ func (s *Server) serve() {
 }
 
 // Register registers a specific control interface with the server.
-func (s *Server) Register(obj interface{}) {
+func (s *Server) Register(obj any) {
 	s.server.Register(obj)
 }
 

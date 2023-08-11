@@ -20,13 +20,13 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi"
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/binary"
+	"gvisor.dev/gvisor/pkg/bits"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/socket/control"
-	"gvisor.dev/gvisor/pkg/sentry/socket/epsocket"
+	"gvisor.dev/gvisor/pkg/sentry/socket"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink"
 	slinux "gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
 )
 
 // SocketFamily are the possible socket(2) families.
@@ -101,6 +101,7 @@ var SocketFlagSet = abi.FlagSet{
 var ipProtocol = abi.ValueSet{
 	linux.IPPROTO_IP:      "IPPROTO_IP",
 	linux.IPPROTO_ICMP:    "IPPROTO_ICMP",
+	linux.IPPROTO_ICMPV6:  "IPPROTO_ICMPV6",
 	linux.IPPROTO_IGMP:    "IPPROTO_IGMP",
 	linux.IPPROTO_IPIP:    "IPPROTO_IPIP",
 	linux.IPPROTO_TCP:     "IPPROTO_TCP",
@@ -161,26 +162,33 @@ var controlMessageType = map[int32]string{
 	linux.SO_TIMESTAMP:    "SO_TIMESTAMP",
 }
 
-func cmsghdr(t *kernel.Task, addr usermem.Addr, length uint64, maxBytes uint64) string {
+func unmarshalControlMessageRights(src []byte) []primitive.Int32 {
+	count := len(src) / linux.SizeOfControlMessageRight
+	cmr := make([]primitive.Int32, count)
+	primitive.UnmarshalUnsafeInt32Slice(cmr, src)
+	return cmr
+}
+
+func cmsghdr(t *kernel.Task, addr hostarch.Addr, length uint64, maxBytes uint64) string {
 	if length > maxBytes {
 		return fmt.Sprintf("%#x (error decoding control: invalid length (%d))", addr, length)
 	}
 
 	buf := make([]byte, length)
-	if _, err := t.CopyIn(addr, &buf); err != nil {
+	if _, err := t.CopyInBytes(addr, buf); err != nil {
 		return fmt.Sprintf("%#x (error decoding control: %v)", addr, err)
 	}
 
 	var strs []string
 
-	for i := 0; i < len(buf); {
-		if i+linux.SizeOfControlMessageHeader > len(buf) {
+	for len(buf) > 0 {
+		if linux.SizeOfControlMessageHeader > len(buf) {
 			strs = append(strs, "{invalid control message (too short)}")
 			break
 		}
 
 		var h linux.ControlMessageHeader
-		binary.Unmarshal(buf[i:i+linux.SizeOfControlMessageHeader], usermem.ByteOrder, &h)
+		buf = h.UnmarshalUnsafe(buf)
 
 		var skipData bool
 		level := "SOL_SOCKET"
@@ -195,7 +203,9 @@ func cmsghdr(t *kernel.Task, addr usermem.Addr, length uint64, maxBytes uint64) 
 			typ = fmt.Sprint(h.Type)
 		}
 
-		if h.Length > uint64(len(buf)-i) {
+		width := t.Arch().Width()
+		length := int(h.Length) - linux.SizeOfControlMessageHeader
+		if length > len(buf) {
 			strs = append(strs, fmt.Sprintf(
 				"{level=%s, type=%s, length=%d, content extends beyond buffer}",
 				level,
@@ -205,96 +215,100 @@ func cmsghdr(t *kernel.Task, addr usermem.Addr, length uint64, maxBytes uint64) 
 			break
 		}
 
-		i += linux.SizeOfControlMessageHeader
-		width := t.Arch().Width()
-		length := int(h.Length) - linux.SizeOfControlMessageHeader
+		if length < 0 {
+			strs = append(strs, fmt.Sprintf(
+				"{level=%s, type=%s, length=%d, content too short}",
+				level,
+				typ,
+				h.Length,
+			))
+			break
+		}
 
 		if skipData {
 			strs = append(strs, fmt.Sprintf("{level=%s, type=%s, length=%d}", level, typ, h.Length))
-			i += control.AlignUp(length, width)
-			continue
-		}
+		} else {
+			switch h.Type {
+			case linux.SCM_RIGHTS:
+				rightsSize := bits.AlignDown(length, linux.SizeOfControlMessageRight)
+				fds := unmarshalControlMessageRights(buf[:rightsSize])
+				rights := make([]string, 0, len(fds))
+				for _, fd := range fds {
+					rights = append(rights, fmt.Sprint(fd))
+				}
 
-		switch h.Type {
-		case linux.SCM_RIGHTS:
-			rightsSize := control.AlignDown(length, linux.SizeOfControlMessageRight)
-
-			numRights := rightsSize / linux.SizeOfControlMessageRight
-			fds := make(linux.ControlMessageRights, numRights)
-			binary.Unmarshal(buf[i:i+rightsSize], usermem.ByteOrder, &fds)
-
-			rights := make([]string, 0, len(fds))
-			for _, fd := range fds {
-				rights = append(rights, fmt.Sprint(fd))
-			}
-
-			strs = append(strs, fmt.Sprintf(
-				"{level=%s, type=%s, length=%d, content: %s}",
-				level,
-				typ,
-				h.Length,
-				strings.Join(rights, ","),
-			))
-
-		case linux.SCM_CREDENTIALS:
-			if length < linux.SizeOfControlMessageCredentials {
 				strs = append(strs, fmt.Sprintf(
-					"{level=%s, type=%s, length=%d, content too short}",
+					"{level=%s, type=%s, length=%d, content: %s}",
 					level,
 					typ,
 					h.Length,
+					strings.Join(rights, ","),
 				))
-				break
-			}
 
-			var creds linux.ControlMessageCredentials
-			binary.Unmarshal(buf[i:i+linux.SizeOfControlMessageCredentials], usermem.ByteOrder, &creds)
+			case linux.SCM_CREDENTIALS:
+				if length < linux.SizeOfControlMessageCredentials {
+					strs = append(strs, fmt.Sprintf(
+						"{level=%s, type=%s, length=%d, content too short}",
+						level,
+						typ,
+						h.Length,
+					))
+					break
+				}
 
-			strs = append(strs, fmt.Sprintf(
-				"{level=%s, type=%s, length=%d, pid: %d, uid: %d, gid: %d}",
-				level,
-				typ,
-				h.Length,
-				creds.PID,
-				creds.UID,
-				creds.GID,
-			))
+				var creds linux.ControlMessageCredentials
+				creds.UnmarshalUnsafe(buf)
 
-		case linux.SO_TIMESTAMP:
-			if length < linux.SizeOfTimeval {
 				strs = append(strs, fmt.Sprintf(
-					"{level=%s, type=%s, length=%d, content too short}",
+					"{level=%s, type=%s, length=%d, pid: %d, uid: %d, gid: %d}",
 					level,
 					typ,
 					h.Length,
+					creds.PID,
+					creds.UID,
+					creds.GID,
 				))
-				break
+
+			case linux.SO_TIMESTAMP:
+				if length < linux.SizeOfTimeval {
+					strs = append(strs, fmt.Sprintf(
+						"{level=%s, type=%s, length=%d, content too short}",
+						level,
+						typ,
+						h.Length,
+					))
+					break
+				}
+
+				var tv linux.Timeval
+				tv.UnmarshalUnsafe(buf)
+
+				strs = append(strs, fmt.Sprintf(
+					"{level=%s, type=%s, length=%d, Sec: %d, Usec: %d}",
+					level,
+					typ,
+					h.Length,
+					tv.Sec,
+					tv.Usec,
+				))
+
+			default:
+				panic("unreachable")
 			}
-
-			var tv linux.Timeval
-			binary.Unmarshal(buf[i:i+linux.SizeOfTimeval], usermem.ByteOrder, &tv)
-
-			strs = append(strs, fmt.Sprintf(
-				"{level=%s, type=%s, length=%d, Sec: %d, Usec: %d}",
-				level,
-				typ,
-				h.Length,
-				tv.Sec,
-				tv.Usec,
-			))
-
-		default:
-			panic("unreachable")
 		}
-		i += control.AlignUp(length, width)
+		if shift := bits.AlignUp(length, width); shift > len(buf) {
+			buf = buf[:0]
+		} else {
+			buf = buf[shift:]
+		}
 	}
 
 	return fmt.Sprintf("%#x %s", addr, strings.Join(strs, ", "))
 }
 
-func msghdr(t *kernel.Task, addr usermem.Addr, printContent bool, maxBytes uint64) string {
+func msghdr(t *kernel.Task, addr hostarch.Addr, printContent bool, maxBytes uint64) string {
 	var msg slinux.MessageHeader64
-	if err := slinux.CopyInMessageHeader64(t, addr, &msg); err != nil {
+	if _, err := msg.CopyIn(t, addr); err != nil {
 		return fmt.Sprintf("%#x (error decoding msghdr: %v)", addr, err)
 	}
 	s := fmt.Sprintf(
@@ -302,17 +316,17 @@ func msghdr(t *kernel.Task, addr usermem.Addr, printContent bool, maxBytes uint6
 		addr,
 		msg.Name,
 		msg.NameLen,
-		iovecs(t, usermem.Addr(msg.Iov), int(msg.IovLen), printContent, maxBytes),
+		iovecs(t, hostarch.Addr(msg.Iov), int(msg.IovLen), printContent, maxBytes),
 	)
 	if printContent {
-		s = fmt.Sprintf("%s, control={%s}", s, cmsghdr(t, usermem.Addr(msg.Control), msg.ControlLen, maxBytes))
+		s = fmt.Sprintf("%s, control={%s}", s, cmsghdr(t, hostarch.Addr(msg.Control), msg.ControlLen, maxBytes))
 	} else {
 		s = fmt.Sprintf("%s, control=%#x, control_len=%d", s, msg.Control, msg.ControlLen)
 	}
 	return fmt.Sprintf("%s, flags=%d}", s, msg.Flags)
 }
 
-func sockAddr(t *kernel.Task, addr usermem.Addr, length uint32) string {
+func sockAddr(t *kernel.Task, addr hostarch.Addr, length uint32) string {
 	if addr == 0 {
 		return "null"
 	}
@@ -326,19 +340,19 @@ func sockAddr(t *kernel.Task, addr usermem.Addr, length uint32) string {
 	if len(b) < 2 {
 		return fmt.Sprintf("%#x {address too short: %d bytes}", addr, len(b))
 	}
-	family := usermem.ByteOrder.Uint16(b)
+	family := hostarch.ByteOrder.Uint16(b)
 
 	familyStr := SocketFamily.Parse(uint64(family))
 
 	switch family {
 	case linux.AF_INET, linux.AF_INET6, linux.AF_UNIX:
-		fa, _, err := epsocket.AddressAndFamily(int(family), b, true /* strict */)
+		fa, _, err := socket.AddressAndFamily(b)
 		if err != nil {
 			return fmt.Sprintf("%#x {Family: %s, error extracting address: %v}", addr, familyStr, err)
 		}
 
 		if family == linux.AF_UNIX {
-			return fmt.Sprintf("%#x {Family: %s, Addr: %q}", addr, familyStr, string(fa.Addr))
+			return fmt.Sprintf("%#x {Family: %s, Addr: %q}", addr, familyStr, string(fa.Addr.AsSlice()))
 		}
 
 		return fmt.Sprintf("%#x {Family: %s, Addr: %v, Port: %d}", addr, familyStr, fa.Addr, fa.Port)
@@ -353,7 +367,7 @@ func sockAddr(t *kernel.Task, addr usermem.Addr, length uint32) string {
 	}
 }
 
-func postSockAddr(t *kernel.Task, addr usermem.Addr, lengthPtr usermem.Addr) string {
+func postSockAddr(t *kernel.Task, addr hostarch.Addr, lengthPtr hostarch.Addr) string {
 	if addr == 0 {
 		return "null"
 	}
@@ -370,14 +384,14 @@ func postSockAddr(t *kernel.Task, addr usermem.Addr, lengthPtr usermem.Addr) str
 	return sockAddr(t, addr, l)
 }
 
-func copySockLen(t *kernel.Task, addr usermem.Addr) (uint32, error) {
+func copySockLen(t *kernel.Task, addr hostarch.Addr) (uint32, error) {
 	// socklen_t is 32-bits.
-	var l uint32
-	_, err := t.CopyIn(addr, &l)
-	return l, err
+	var l primitive.Uint32
+	_, err := l.CopyIn(t, addr)
+	return uint32(l), err
 }
 
-func sockLenPointer(t *kernel.Task, addr usermem.Addr) string {
+func sockLenPointer(t *kernel.Task, addr hostarch.Addr) string {
 	if addr == 0 {
 		return "null"
 	}
@@ -409,4 +423,232 @@ func sockFlags(flags int32) string {
 		return "0"
 	}
 	return SocketFlagSet.Parse(uint64(flags))
+}
+
+func getSockOptVal(t *kernel.Task, level, optname uint64, optVal hostarch.Addr, optLen hostarch.Addr, maximumBlobSize uint, rval uintptr) string {
+	if int(rval) < 0 {
+		return hexNum(uint64(optVal))
+	}
+	if optVal == 0 {
+		return "null"
+	}
+	l, err := copySockLen(t, optLen)
+	if err != nil {
+		return fmt.Sprintf("%#x {error reading length: %v}", optLen, err)
+	}
+	return sockOptVal(t, level, optname, optVal, uint64(l), maximumBlobSize)
+}
+
+func sockOptVal(t *kernel.Task, level, optname uint64, optVal hostarch.Addr, optLen uint64, maximumBlobSize uint) string {
+	switch optLen {
+	case 1:
+		var v primitive.Uint8
+		_, err := v.CopyIn(t, optVal)
+		if err != nil {
+			return fmt.Sprintf("%#x {error reading optval: %v}", optVal, err)
+		}
+		return fmt.Sprintf("%#x {value=%v}", optVal, v)
+	case 2:
+		var v primitive.Uint16
+		_, err := v.CopyIn(t, optVal)
+		if err != nil {
+			return fmt.Sprintf("%#x {error reading optval: %v}", optVal, err)
+		}
+		return fmt.Sprintf("%#x {value=%v}", optVal, v)
+	case 4:
+		var v primitive.Uint32
+		_, err := v.CopyIn(t, optVal)
+		if err != nil {
+			return fmt.Sprintf("%#x {error reading optval: %v}", optVal, err)
+		}
+		return fmt.Sprintf("%#x {value=%v}", optVal, v)
+	default:
+		return dump(t, optVal, uint(optLen), maximumBlobSize, true /* content */)
+	}
+}
+
+var sockOptLevels = abi.ValueSet{
+	linux.SOL_IP:      "SOL_IP",
+	linux.SOL_SOCKET:  "SOL_SOCKET",
+	linux.SOL_TCP:     "SOL_TCP",
+	linux.SOL_UDP:     "SOL_UDP",
+	linux.SOL_IPV6:    "SOL_IPV6",
+	linux.SOL_ICMPV6:  "SOL_ICMPV6",
+	linux.SOL_RAW:     "SOL_RAW",
+	linux.SOL_PACKET:  "SOL_PACKET",
+	linux.SOL_NETLINK: "SOL_NETLINK",
+}
+
+var sockOptNames = map[uint64]abi.ValueSet{
+	linux.SOL_IP: {
+		linux.IP_TTL:                    "IP_TTL",
+		linux.IP_MULTICAST_TTL:          "IP_MULTICAST_TTL",
+		linux.IP_MULTICAST_IF:           "IP_MULTICAST_IF",
+		linux.IP_MULTICAST_LOOP:         "IP_MULTICAST_LOOP",
+		linux.IP_TOS:                    "IP_TOS",
+		linux.IP_RECVTOS:                "IP_RECVTOS",
+		linux.IPT_SO_GET_INFO:           "IPT_SO_GET_INFO",
+		linux.IPT_SO_GET_ENTRIES:        "IPT_SO_GET_ENTRIES",
+		linux.IP_ADD_MEMBERSHIP:         "IP_ADD_MEMBERSHIP",
+		linux.IP_DROP_MEMBERSHIP:        "IP_DROP_MEMBERSHIP",
+		linux.MCAST_JOIN_GROUP:          "MCAST_JOIN_GROUP",
+		linux.IP_ADD_SOURCE_MEMBERSHIP:  "IP_ADD_SOURCE_MEMBERSHIP",
+		linux.IP_BIND_ADDRESS_NO_PORT:   "IP_BIND_ADDRESS_NO_PORT",
+		linux.IP_BLOCK_SOURCE:           "IP_BLOCK_SOURCE",
+		linux.IP_CHECKSUM:               "IP_CHECKSUM",
+		linux.IP_DROP_SOURCE_MEMBERSHIP: "IP_DROP_SOURCE_MEMBERSHIP",
+		linux.IP_FREEBIND:               "IP_FREEBIND",
+		linux.IP_HDRINCL:                "IP_HDRINCL",
+		linux.IP_IPSEC_POLICY:           "IP_IPSEC_POLICY",
+		linux.IP_MINTTL:                 "IP_MINTTL",
+		linux.IP_MSFILTER:               "IP_MSFILTER",
+		linux.IP_MTU_DISCOVER:           "IP_MTU_DISCOVER",
+		linux.IP_MULTICAST_ALL:          "IP_MULTICAST_ALL",
+		linux.IP_NODEFRAG:               "IP_NODEFRAG",
+		linux.IP_OPTIONS:                "IP_OPTIONS",
+		linux.IP_PASSSEC:                "IP_PASSSEC",
+		linux.IP_PKTINFO:                "IP_PKTINFO",
+		linux.IP_RECVERR:                "IP_RECVERR",
+		linux.IP_RECVFRAGSIZE:           "IP_RECVFRAGSIZE",
+		linux.IP_RECVOPTS:               "IP_RECVOPTS",
+		linux.IP_RECVORIGDSTADDR:        "IP_RECVORIGDSTADDR",
+		linux.IP_RECVTTL:                "IP_RECVTTL",
+		linux.IP_RETOPTS:                "IP_RETOPTS",
+		linux.IP_TRANSPARENT:            "IP_TRANSPARENT",
+		linux.IP_UNBLOCK_SOURCE:         "IP_UNBLOCK_SOURCE",
+		linux.IP_UNICAST_IF:             "IP_UNICAST_IF",
+		linux.IP_XFRM_POLICY:            "IP_XFRM_POLICY",
+		linux.MCAST_BLOCK_SOURCE:        "MCAST_BLOCK_SOURCE",
+		linux.MCAST_JOIN_SOURCE_GROUP:   "MCAST_JOIN_SOURCE_GROUP",
+		linux.MCAST_LEAVE_GROUP:         "MCAST_LEAVE_GROUP",
+		linux.MCAST_LEAVE_SOURCE_GROUP:  "MCAST_LEAVE_SOURCE_GROUP",
+		linux.MCAST_MSFILTER:            "MCAST_MSFILTER",
+		linux.MCAST_UNBLOCK_SOURCE:      "MCAST_UNBLOCK_SOURCE",
+		linux.IP_ROUTER_ALERT:           "IP_ROUTER_ALERT",
+		linux.IP_PKTOPTIONS:             "IP_PKTOPTIONS",
+		linux.IP_MTU:                    "IP_MTU",
+		linux.SO_ORIGINAL_DST:           "SO_ORIGINAL_DST",
+	},
+	linux.SOL_SOCKET: {
+		linux.SO_ERROR:        "SO_ERROR",
+		linux.SO_PEERCRED:     "SO_PEERCRED",
+		linux.SO_PASSCRED:     "SO_PASSCRED",
+		linux.SO_SNDBUF:       "SO_SNDBUF",
+		linux.SO_RCVBUF:       "SO_RCVBUF",
+		linux.SO_REUSEADDR:    "SO_REUSEADDR",
+		linux.SO_REUSEPORT:    "SO_REUSEPORT",
+		linux.SO_BINDTODEVICE: "SO_BINDTODEVICE",
+		linux.SO_BROADCAST:    "SO_BROADCAST",
+		linux.SO_KEEPALIVE:    "SO_KEEPALIVE",
+		linux.SO_LINGER:       "SO_LINGER",
+		linux.SO_SNDTIMEO:     "SO_SNDTIMEO",
+		linux.SO_RCVTIMEO:     "SO_RCVTIMEO",
+		linux.SO_OOBINLINE:    "SO_OOBINLINE",
+		linux.SO_TIMESTAMP:    "SO_TIMESTAMP",
+		linux.SO_ACCEPTCONN:   "SO_ACCEPTCONN",
+	},
+	linux.SOL_TCP: {
+		linux.TCP_NODELAY:              "TCP_NODELAY",
+		linux.TCP_CORK:                 "TCP_CORK",
+		linux.TCP_QUICKACK:             "TCP_QUICKACK",
+		linux.TCP_MAXSEG:               "TCP_MAXSEG",
+		linux.TCP_KEEPIDLE:             "TCP_KEEPIDLE",
+		linux.TCP_KEEPINTVL:            "TCP_KEEPINTVL",
+		linux.TCP_USER_TIMEOUT:         "TCP_USER_TIMEOUT",
+		linux.TCP_INFO:                 "TCP_INFO",
+		linux.TCP_CC_INFO:              "TCP_CC_INFO",
+		linux.TCP_NOTSENT_LOWAT:        "TCP_NOTSENT_LOWAT",
+		linux.TCP_ZEROCOPY_RECEIVE:     "TCP_ZEROCOPY_RECEIVE",
+		linux.TCP_CONGESTION:           "TCP_CONGESTION",
+		linux.TCP_LINGER2:              "TCP_LINGER2",
+		linux.TCP_DEFER_ACCEPT:         "TCP_DEFER_ACCEPT",
+		linux.TCP_REPAIR_OPTIONS:       "TCP_REPAIR_OPTIONS",
+		linux.TCP_INQ:                  "TCP_INQ",
+		linux.TCP_FASTOPEN:             "TCP_FASTOPEN",
+		linux.TCP_FASTOPEN_CONNECT:     "TCP_FASTOPEN_CONNECT",
+		linux.TCP_FASTOPEN_KEY:         "TCP_FASTOPEN_KEY",
+		linux.TCP_FASTOPEN_NO_COOKIE:   "TCP_FASTOPEN_NO_COOKIE",
+		linux.TCP_KEEPCNT:              "TCP_KEEPCNT",
+		linux.TCP_QUEUE_SEQ:            "TCP_QUEUE_SEQ",
+		linux.TCP_REPAIR:               "TCP_REPAIR",
+		linux.TCP_REPAIR_QUEUE:         "TCP_REPAIR_QUEUE",
+		linux.TCP_REPAIR_WINDOW:        "TCP_REPAIR_WINDOW",
+		linux.TCP_SAVED_SYN:            "TCP_SAVED_SYN",
+		linux.TCP_SAVE_SYN:             "TCP_SAVE_SYN",
+		linux.TCP_SYNCNT:               "TCP_SYNCNT",
+		linux.TCP_THIN_DUPACK:          "TCP_THIN_DUPACK",
+		linux.TCP_THIN_LINEAR_TIMEOUTS: "TCP_THIN_LINEAR_TIMEOUTS",
+		linux.TCP_TIMESTAMP:            "TCP_TIMESTAMP",
+		linux.TCP_ULP:                  "TCP_ULP",
+		linux.TCP_WINDOW_CLAMP:         "TCP_WINDOW_CLAMP",
+	},
+	linux.SOL_IPV6: {
+		linux.IPV6_V6ONLY:              "IPV6_V6ONLY",
+		linux.IPV6_PATHMTU:             "IPV6_PATHMTU",
+		linux.IPV6_TCLASS:              "IPV6_TCLASS",
+		linux.IPV6_ADD_MEMBERSHIP:      "IPV6_ADD_MEMBERSHIP",
+		linux.IPV6_DROP_MEMBERSHIP:     "IPV6_DROP_MEMBERSHIP",
+		linux.IPV6_IPSEC_POLICY:        "IPV6_IPSEC_POLICY",
+		linux.IPV6_JOIN_ANYCAST:        "IPV6_JOIN_ANYCAST",
+		linux.IPV6_LEAVE_ANYCAST:       "IPV6_LEAVE_ANYCAST",
+		linux.IPV6_PKTINFO:             "IPV6_PKTINFO",
+		linux.IPV6_ROUTER_ALERT:        "IPV6_ROUTER_ALERT",
+		linux.IPV6_XFRM_POLICY:         "IPV6_XFRM_POLICY",
+		linux.MCAST_BLOCK_SOURCE:       "MCAST_BLOCK_SOURCE",
+		linux.MCAST_JOIN_GROUP:         "MCAST_JOIN_GROUP",
+		linux.MCAST_JOIN_SOURCE_GROUP:  "MCAST_JOIN_SOURCE_GROUP",
+		linux.MCAST_LEAVE_GROUP:        "MCAST_LEAVE_GROUP",
+		linux.MCAST_LEAVE_SOURCE_GROUP: "MCAST_LEAVE_SOURCE_GROUP",
+		linux.MCAST_UNBLOCK_SOURCE:     "MCAST_UNBLOCK_SOURCE",
+		linux.IPV6_2292DSTOPTS:         "IPV6_2292DSTOPTS",
+		linux.IPV6_2292HOPLIMIT:        "IPV6_2292HOPLIMIT",
+		linux.IPV6_2292HOPOPTS:         "IPV6_2292HOPOPTS",
+		linux.IPV6_2292PKTINFO:         "IPV6_2292PKTINFO",
+		linux.IPV6_2292PKTOPTIONS:      "IPV6_2292PKTOPTIONS",
+		linux.IPV6_2292RTHDR:           "IPV6_2292RTHDR",
+		linux.IPV6_ADDR_PREFERENCES:    "IPV6_ADDR_PREFERENCES",
+		linux.IPV6_AUTOFLOWLABEL:       "IPV6_AUTOFLOWLABEL",
+		linux.IPV6_DONTFRAG:            "IPV6_DONTFRAG",
+		linux.IPV6_DSTOPTS:             "IPV6_DSTOPTS",
+		linux.IPV6_FLOWINFO:            "IPV6_FLOWINFO",
+		linux.IPV6_FLOWINFO_SEND:       "IPV6_FLOWINFO_SEND",
+		linux.IPV6_FLOWLABEL_MGR:       "IPV6_FLOWLABEL_MGR",
+		linux.IPV6_FREEBIND:            "IPV6_FREEBIND",
+		linux.IPV6_HOPOPTS:             "IPV6_HOPOPTS",
+		linux.IPV6_MINHOPCOUNT:         "IPV6_MINHOPCOUNT",
+		linux.IPV6_MTU:                 "IPV6_MTU",
+		linux.IPV6_MTU_DISCOVER:        "IPV6_MTU_DISCOVER",
+		linux.IPV6_MULTICAST_ALL:       "IPV6_MULTICAST_ALL",
+		linux.IPV6_MULTICAST_HOPS:      "IPV6_MULTICAST_HOPS",
+		linux.IPV6_MULTICAST_IF:        "IPV6_MULTICAST_IF",
+		linux.IPV6_MULTICAST_LOOP:      "IPV6_MULTICAST_LOOP",
+		linux.IPV6_RECVDSTOPTS:         "IPV6_RECVDSTOPTS",
+		linux.IPV6_RECVERR:             "IPV6_RECVERR",
+		linux.IPV6_RECVFRAGSIZE:        "IPV6_RECVFRAGSIZE",
+		linux.IPV6_RECVHOPLIMIT:        "IPV6_RECVHOPLIMIT",
+		linux.IPV6_RECVHOPOPTS:         "IPV6_RECVHOPOPTS",
+		linux.IPV6_RECVORIGDSTADDR:     "IPV6_RECVORIGDSTADDR",
+		linux.IPV6_RECVPATHMTU:         "IPV6_RECVPATHMTU",
+		linux.IPV6_RECVPKTINFO:         "IPV6_RECVPKTINFO",
+		linux.IPV6_RECVRTHDR:           "IPV6_RECVRTHDR",
+		linux.IPV6_RECVTCLASS:          "IPV6_RECVTCLASS",
+		linux.IPV6_RTHDR:               "IPV6_RTHDR",
+		linux.IPV6_RTHDRDSTOPTS:        "IPV6_RTHDRDSTOPTS",
+		linux.IPV6_TRANSPARENT:         "IPV6_TRANSPARENT",
+		linux.IPV6_UNICAST_HOPS:        "IPV6_UNICAST_HOPS",
+		linux.IPV6_UNICAST_IF:          "IPV6_UNICAST_IF",
+		linux.MCAST_MSFILTER:           "MCAST_MSFILTER",
+		linux.IPV6_ADDRFORM:            "IPV6_ADDRFORM",
+		linux.IP6T_SO_GET_INFO:         "IP6T_SO_GET_INFO",
+		linux.IP6T_SO_GET_ENTRIES:      "IP6T_SO_GET_ENTRIES",
+	},
+	linux.SOL_NETLINK: {
+		linux.NETLINK_BROADCAST_ERROR:  "NETLINK_BROADCAST_ERROR",
+		linux.NETLINK_CAP_ACK:          "NETLINK_CAP_ACK",
+		linux.NETLINK_DUMP_STRICT_CHK:  "NETLINK_DUMP_STRICT_CHK",
+		linux.NETLINK_EXT_ACK:          "NETLINK_EXT_ACK",
+		linux.NETLINK_LIST_MEMBERSHIPS: "NETLINK_LIST_MEMBERSHIPS",
+		linux.NETLINK_NO_ENOBUFS:       "NETLINK_NO_ENOBUFS",
+		linux.NETLINK_PKTINFO:          "NETLINK_PKTINFO",
+	},
 }

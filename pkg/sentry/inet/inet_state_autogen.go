@@ -6,21 +6,96 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *TCPBufferSize) beforeSave() {}
-func (x *TCPBufferSize) save(m state.Map) {
-	x.beforeSave()
-	m.Save("Min", &x.Min)
-	m.Save("Default", &x.Default)
-	m.Save("Max", &x.Max)
+func (t *TCPBufferSize) StateTypeName() string {
+	return "pkg/sentry/inet.TCPBufferSize"
 }
 
-func (x *TCPBufferSize) afterLoad() {}
-func (x *TCPBufferSize) load(m state.Map) {
-	m.Load("Min", &x.Min)
-	m.Load("Default", &x.Default)
-	m.Load("Max", &x.Max)
+func (t *TCPBufferSize) StateFields() []string {
+	return []string{
+		"Min",
+		"Default",
+		"Max",
+	}
+}
+
+func (t *TCPBufferSize) beforeSave() {}
+
+// +checklocksignore
+func (t *TCPBufferSize) StateSave(stateSinkObject state.Sink) {
+	t.beforeSave()
+	stateSinkObject.Save(0, &t.Min)
+	stateSinkObject.Save(1, &t.Default)
+	stateSinkObject.Save(2, &t.Max)
+}
+
+func (t *TCPBufferSize) afterLoad() {}
+
+// +checklocksignore
+func (t *TCPBufferSize) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &t.Min)
+	stateSourceObject.Load(1, &t.Default)
+	stateSourceObject.Load(2, &t.Max)
+}
+
+func (n *Namespace) StateTypeName() string {
+	return "pkg/sentry/inet.Namespace"
+}
+
+func (n *Namespace) StateFields() []string {
+	return []string{
+		"inode",
+		"creator",
+		"isRoot",
+		"userNS",
+	}
+}
+
+func (n *Namespace) beforeSave() {}
+
+// +checklocksignore
+func (n *Namespace) StateSave(stateSinkObject state.Sink) {
+	n.beforeSave()
+	stateSinkObject.Save(0, &n.inode)
+	stateSinkObject.Save(1, &n.creator)
+	stateSinkObject.Save(2, &n.isRoot)
+	stateSinkObject.Save(3, &n.userNS)
+}
+
+// +checklocksignore
+func (n *Namespace) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &n.inode)
+	stateSourceObject.LoadWait(1, &n.creator)
+	stateSourceObject.Load(2, &n.isRoot)
+	stateSourceObject.Load(3, &n.userNS)
+	stateSourceObject.AfterLoad(n.afterLoad)
+}
+
+func (r *namespaceRefs) StateTypeName() string {
+	return "pkg/sentry/inet.namespaceRefs"
+}
+
+func (r *namespaceRefs) StateFields() []string {
+	return []string{
+		"refCount",
+	}
+}
+
+func (r *namespaceRefs) beforeSave() {}
+
+// +checklocksignore
+func (r *namespaceRefs) StateSave(stateSinkObject state.Sink) {
+	r.beforeSave()
+	stateSinkObject.Save(0, &r.refCount)
+}
+
+// +checklocksignore
+func (r *namespaceRefs) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &r.refCount)
+	stateSourceObject.AfterLoad(r.afterLoad)
 }
 
 func init() {
-	state.Register("inet.TCPBufferSize", (*TCPBufferSize)(nil), state.Fns{Save: (*TCPBufferSize).save, Load: (*TCPBufferSize).load})
+	state.Register((*TCPBufferSize)(nil))
+	state.Register((*Namespace)(nil))
+	state.Register((*namespaceRefs)(nil))
 }

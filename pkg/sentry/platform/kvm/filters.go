@@ -1,4 +1,4 @@
-// Copyright 2019 The gVisor Authors.
+// Copyright 2022 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,19 +15,44 @@
 package kvm
 
 import (
-	"syscall"
+	"golang.org/x/sys/unix"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/seccomp"
 )
 
 // SyscallFilters returns syscalls made exclusively by the KVM platform.
-func (*KVM) SyscallFilters() seccomp.SyscallRules {
-	return seccomp.SyscallRules{
-		syscall.SYS_ARCH_PRCTL:      {},
-		syscall.SYS_IOCTL:           {},
-		syscall.SYS_MMAP:            {},
-		syscall.SYS_RT_SIGSUSPEND:   {},
-		syscall.SYS_RT_SIGTIMEDWAIT: {},
-		0xffffffffffffffff:          {}, // KVM uses syscall -1 to transition to host.
-	}
+func (k *KVM) SyscallFilters() seccomp.SyscallRules {
+	r := k.archSyscallFilters()
+	r.Merge(seccomp.SyscallRules{
+		unix.SYS_IOCTL: []seccomp.Rule{
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(_KVM_RUN),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(_KVM_SET_USER_MEMORY_REGION),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(_KVM_GET_REGS),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(_KVM_SET_REGS),
+			},
+		},
+		unix.SYS_MEMBARRIER: []seccomp.Rule{
+			{
+				seccomp.EqualTo(linux.MEMBARRIER_CMD_PRIVATE_EXPEDITED),
+				seccomp.EqualTo(0),
+			},
+		},
+		unix.SYS_MMAP:            {},
+		unix.SYS_RT_SIGSUSPEND:   {},
+		unix.SYS_RT_SIGTIMEDWAIT: {},
+		_SYS_KVM_RETURN_TO_HOST:  {},
+	})
+	return r
 }

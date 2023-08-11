@@ -6,70 +6,117 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *AtomicPtrBucket) beforeSave() {}
-func (x *AtomicPtrBucket) save(m state.Map) {
-	x.beforeSave()
-	var ptr *bucket = x.savePtr()
-	m.SaveValue("ptr", ptr)
+func (b *bucket) StateTypeName() string {
+	return "pkg/sentry/kernel/futex.bucket"
 }
 
-func (x *AtomicPtrBucket) afterLoad() {}
-func (x *AtomicPtrBucket) load(m state.Map) {
-	m.LoadValue("ptr", new(*bucket), func(y interface{}) { x.loadPtr(y.(*bucket)) })
+func (b *bucket) StateFields() []string {
+	return []string{}
 }
 
-func (x *bucket) beforeSave() {}
-func (x *bucket) save(m state.Map) {
-	x.beforeSave()
-	if !state.IsZeroValue(x.waiters) { m.Failf("waiters is %v, expected zero", x.waiters) }
+func (b *bucket) beforeSave() {}
+
+// +checklocksignore
+func (b *bucket) StateSave(stateSinkObject state.Sink) {
+	b.beforeSave()
+	if !state.IsZeroValue(&b.waiters) {
+		state.Failf("waiters is %#v, expected zero", &b.waiters)
+	}
 }
 
-func (x *bucket) afterLoad() {}
-func (x *bucket) load(m state.Map) {
+func (b *bucket) afterLoad() {}
+
+// +checklocksignore
+func (b *bucket) StateLoad(stateSourceObject state.Source) {
 }
 
-func (x *Manager) beforeSave() {}
-func (x *Manager) save(m state.Map) {
-	x.beforeSave()
-	if !state.IsZeroValue(x.privateBuckets) { m.Failf("privateBuckets is %v, expected zero", x.privateBuckets) }
-	m.Save("sharedBucket", &x.sharedBucket)
+func (m *Manager) StateTypeName() string {
+	return "pkg/sentry/kernel/futex.Manager"
 }
 
-func (x *Manager) afterLoad() {}
-func (x *Manager) load(m state.Map) {
-	m.Load("sharedBucket", &x.sharedBucket)
+func (m *Manager) StateFields() []string {
+	return []string{
+		"sharedBucket",
+	}
 }
 
-func (x *waiterList) beforeSave() {}
-func (x *waiterList) save(m state.Map) {
-	x.beforeSave()
-	m.Save("head", &x.head)
-	m.Save("tail", &x.tail)
+func (m *Manager) beforeSave() {}
+
+// +checklocksignore
+func (m *Manager) StateSave(stateSinkObject state.Sink) {
+	m.beforeSave()
+	if !state.IsZeroValue(&m.privateBuckets) {
+		state.Failf("privateBuckets is %#v, expected zero", &m.privateBuckets)
+	}
+	stateSinkObject.Save(0, &m.sharedBucket)
 }
 
-func (x *waiterList) afterLoad() {}
-func (x *waiterList) load(m state.Map) {
-	m.Load("head", &x.head)
-	m.Load("tail", &x.tail)
+func (m *Manager) afterLoad() {}
+
+// +checklocksignore
+func (m *Manager) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &m.sharedBucket)
 }
 
-func (x *waiterEntry) beforeSave() {}
-func (x *waiterEntry) save(m state.Map) {
-	x.beforeSave()
-	m.Save("next", &x.next)
-	m.Save("prev", &x.prev)
+func (l *waiterList) StateTypeName() string {
+	return "pkg/sentry/kernel/futex.waiterList"
 }
 
-func (x *waiterEntry) afterLoad() {}
-func (x *waiterEntry) load(m state.Map) {
-	m.Load("next", &x.next)
-	m.Load("prev", &x.prev)
+func (l *waiterList) StateFields() []string {
+	return []string{
+		"head",
+		"tail",
+	}
+}
+
+func (l *waiterList) beforeSave() {}
+
+// +checklocksignore
+func (l *waiterList) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.head)
+	stateSinkObject.Save(1, &l.tail)
+}
+
+func (l *waiterList) afterLoad() {}
+
+// +checklocksignore
+func (l *waiterList) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.head)
+	stateSourceObject.Load(1, &l.tail)
+}
+
+func (e *waiterEntry) StateTypeName() string {
+	return "pkg/sentry/kernel/futex.waiterEntry"
+}
+
+func (e *waiterEntry) StateFields() []string {
+	return []string{
+		"next",
+		"prev",
+	}
+}
+
+func (e *waiterEntry) beforeSave() {}
+
+// +checklocksignore
+func (e *waiterEntry) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+	stateSinkObject.Save(0, &e.next)
+	stateSinkObject.Save(1, &e.prev)
+}
+
+func (e *waiterEntry) afterLoad() {}
+
+// +checklocksignore
+func (e *waiterEntry) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &e.next)
+	stateSourceObject.Load(1, &e.prev)
 }
 
 func init() {
-	state.Register("futex.AtomicPtrBucket", (*AtomicPtrBucket)(nil), state.Fns{Save: (*AtomicPtrBucket).save, Load: (*AtomicPtrBucket).load})
-	state.Register("futex.bucket", (*bucket)(nil), state.Fns{Save: (*bucket).save, Load: (*bucket).load})
-	state.Register("futex.Manager", (*Manager)(nil), state.Fns{Save: (*Manager).save, Load: (*Manager).load})
-	state.Register("futex.waiterList", (*waiterList)(nil), state.Fns{Save: (*waiterList).save, Load: (*waiterList).load})
-	state.Register("futex.waiterEntry", (*waiterEntry)(nil), state.Fns{Save: (*waiterEntry).save, Load: (*waiterEntry).load})
+	state.Register((*bucket)(nil))
+	state.Register((*Manager)(nil))
+	state.Register((*waiterList)(nil))
+	state.Register((*waiterEntry)(nil))
 }
