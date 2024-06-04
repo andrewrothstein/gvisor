@@ -17,7 +17,6 @@ package kernel
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
-	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -30,15 +29,15 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
-// SupportedFlags is the bitwise OR of all the supported flags for clone.
+// SupportedCloneFlags is the bitwise OR of all the supported flags for clone.
 // TODO(b/290826530): Implement CLONE_INTO_CGROUP when cgroups v2 is
 // implemented.
-const SupportedFlags = linux.CLONE_VM | linux.CLONE_FS | linux.CLONE_FILES | linux.CLONE_SYSVSEM |
+const SupportedCloneFlags = linux.CLONE_VM | linux.CLONE_FS | linux.CLONE_FILES | linux.CLONE_SYSVSEM |
 	linux.CLONE_THREAD | linux.CLONE_SIGHAND | linux.CLONE_CHILD_SETTID | linux.CLONE_NEWPID |
 	linux.CLONE_CHILD_CLEARTID | linux.CLONE_CHILD_SETTID | linux.CLONE_PARENT |
 	linux.CLONE_PARENT_SETTID | linux.CLONE_SETTLS | linux.CLONE_NEWUSER | linux.CLONE_NEWUTS |
 	linux.CLONE_NEWIPC | linux.CLONE_NEWNET | linux.CLONE_PTRACE | linux.CLONE_UNTRACED |
-	linux.CLONE_IO | linux.CLONE_VFORK
+	linux.CLONE_IO | linux.CLONE_VFORK | linux.CLONE_DETACHED | linux.CLONE_NEWNS
 
 // Clone implements the clone(2) syscall and returns the thread ID of the new
 // task in t's PID namespace. Clone may return both a non-zero thread ID and a
@@ -47,7 +46,7 @@ const SupportedFlags = linux.CLONE_VM | linux.CLONE_FS | linux.CLONE_FILES | lin
 // Preconditions: The caller must be running Task.doSyscallInvoke on the task
 // goroutine.
 func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
-	if args.Flags&^SupportedFlags != 0 {
+	if args.Flags&^SupportedCloneFlags != 0 {
 		return 0, nil, linuxerr.EINVAL
 	}
 	// Since signal actions may refer to application signal handlers by virtual
@@ -165,6 +164,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	// above Task.mu. So we copy t.image with t.mu held and call Fork() on the copy.
 	t.mu.Lock()
 	curImage := t.image
+	sessionKeyring := t.sessionKeyring
 	t.mu.Unlock()
 	image, err := curImage.Fork(t, t.k, args.Flags&linux.CLONE_VM != 0)
 	if err != nil {
@@ -173,6 +173,12 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	cu.Add(func() {
 		image.release(t)
 	})
+
+	if args.Flags&linux.CLONE_NEWUSER != 0 {
+		// If the task is in a new user namespace, it cannot share keys.
+		sessionKeyring = nil
+	}
+
 	// clone() returns 0 in the child.
 	image.Arch.SetReturn(0)
 	if args.Stack != 0 {
@@ -241,24 +247,25 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	}
 
 	cfg := &TaskConfig{
-		Kernel:                  t.k,
-		ThreadGroup:             tg,
-		SignalMask:              t.SignalMask(),
-		TaskImage:               image,
-		FSContext:               fsContext,
-		FDTable:                 fdTable,
-		Credentials:             creds,
-		Niceness:                t.Niceness(),
-		NetworkNamespace:        netns,
-		AllowedCPUMask:          t.CPUMask(),
-		UTSNamespace:            utsns,
-		IPCNamespace:            ipcns,
-		AbstractSocketNamespace: t.abstractSockets,
-		MountNamespace:          mntns,
-		RSeqAddr:                rseqAddr,
-		RSeqSignature:           rseqSignature,
-		ContainerID:             t.ContainerID(),
-		UserCounters:            uc,
+		Kernel:           t.k,
+		ThreadGroup:      tg,
+		SignalMask:       t.SignalMask(),
+		TaskImage:        image,
+		FSContext:        fsContext,
+		FDTable:          fdTable,
+		Credentials:      creds,
+		Niceness:         t.Niceness(),
+		NetworkNamespace: netns,
+		AllowedCPUMask:   t.CPUMask(),
+		UTSNamespace:     utsns,
+		IPCNamespace:     ipcns,
+		MountNamespace:   mntns,
+		RSeqAddr:         rseqAddr,
+		RSeqSignature:    rseqSignature,
+		ContainerID:      t.ContainerID(),
+		UserCounters:     uc,
+		SessionKeyring:   sessionKeyring,
+		Origin:           t.Origin,
 	}
 	if args.Flags&linux.CLONE_THREAD == 0 {
 		cfg.Parent = t
@@ -317,9 +324,12 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	// "If fork/clone and execve are allowed by @prog, any child processes will
 	// be constrained to the same filters and system call ABI as the parent." -
 	// Documentation/prctl/seccomp_filter.txt
-	if f := t.syscallFilters.Load(); f != nil {
-		copiedFilters := append([]bpf.Program(nil), f.([]bpf.Program)...)
-		nt.syscallFilters.Store(copiedFilters)
+	if ts := t.seccomp.Load(); ts != nil {
+		seccompCopy := ts.copy()
+		seccompCopy.populateCache(nt)
+		nt.seccomp.Store(seccompCopy)
+	} else {
+		nt.seccomp.Store(nil)
 	}
 	if args.Flags&linux.CLONE_VFORK != 0 {
 		nt.vforkParent = t
@@ -502,8 +512,7 @@ func (t *Task) Setns(fd *vfs.FileDescription, flags int32) error {
 		fsContext := oldFSContext.Fork()
 		fsContext.root.DecRef(t)
 		fsContext.cwd.DecRef(t)
-		vd := ns.Root()
-		vd.IncRef()
+		vd := ns.Root(t)
 		fsContext.root = vd
 		vd.IncRef()
 		fsContext.cwd = vd

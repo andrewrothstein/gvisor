@@ -72,11 +72,15 @@ func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns
 		"filesystems":    fs.newInode(ctx, root, 0444, &filesystemsData{}),
 		"loadavg":        fs.newInode(ctx, root, 0444, &loadavgData{}),
 		"sys":            fs.newSysDir(ctx, root, k),
+		"bus":            fs.newStaticDir(ctx, root, map[string]kernfs.Inode{}),
+		"fs":             fs.newStaticDir(ctx, root, map[string]kernfs.Inode{}),
+		"irq":            fs.newStaticDir(ctx, root, map[string]kernfs.Inode{}),
 		"meminfo":        fs.newInode(ctx, root, 0444, &meminfoData{}),
 		"mounts":         kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/mounts"),
 		"net":            kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/net"),
 		"sentry-meminfo": fs.newInode(ctx, root, 0444, &sentryMeminfoData{}),
 		"stat":           fs.newInode(ctx, root, 0444, &statData{}),
+		"sysrq-trigger":  fs.newInode(ctx, root, 0200, newStaticFile("")),
 		"uptime":         fs.newInode(ctx, root, 0444, &uptimeData{}),
 		"version":        fs.newInode(ctx, root, 0444, &versionData{}),
 	}
@@ -262,7 +266,7 @@ func cpuInfoData(k *kernel.Kernel) string {
 	features := k.FeatureSet()
 	var buf bytes.Buffer
 	for i, max := uint(0), k.ApplicationCores(); i < max; i++ {
-		features.WriteCPUInfoTo(i, &buf)
+		features.WriteCPUInfoTo(i, max, &buf)
 	}
 	return buf.String()
 }

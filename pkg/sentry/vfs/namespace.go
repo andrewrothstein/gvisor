@@ -54,6 +54,9 @@ type MountNamespace struct {
 
 	// mounts is the total number of mounts in this mount namespace.
 	mounts uint32
+
+	// pending is the total number of pending mounts in this mount namespace.
+	pending uint32
 }
 
 // Namespace is the namespace interface.
@@ -130,14 +133,15 @@ type cloneEntry struct {
 	parentMount *Mount
 }
 
+// +checklocks:vfs.mountMu
 func (vfs *VirtualFilesystem) updateRootAndCWD(ctx context.Context, root *VirtualDentry, cwd *VirtualDentry, src *Mount, dst *Mount) {
 	if root.mount == src {
-		root.mount.DecRef(ctx)
+		vfs.delayDecRef(root.mount)
 		root.mount = dst
 		root.mount.IncRef()
 	}
 	if cwd.mount == src {
-		cwd.mount.DecRef(ctx)
+		vfs.delayDecRef(cwd.mount)
 		cwd.mount = dst
 		cwd.mount.IncRef()
 	}
@@ -166,51 +170,26 @@ func (vfs *VirtualFilesystem) CloneMountNamespace(
 	}
 
 	newns.Refs = nsfs.GetNamespaceInode(ctx, newns)
-	vdsToDecRef := []VirtualDentry{}
-	defer func() {
-		for _, vd := range vdsToDecRef {
-			vd.DecRef(ctx)
-		}
-	}()
+	vfs.lockMounts()
+	defer vfs.unlockMounts(ctx)
 
-	vfs.mountMu.Lock()
-	defer vfs.mountMu.Unlock()
-
-	ns.root.root.IncRef()
-	ns.root.fs.IncRef()
-	newns.root = newMount(vfs, ns.root.fs, ns.root.root, newns, &MountOptions{Flags: ns.root.Flags, ReadOnly: ns.root.ReadOnly()})
-	if ns.root.propType == Shared {
-		vfs.addPeer(ns.root, newns.root)
+	cloneType := 0
+	if ns.Owner != newns.Owner {
+		cloneType = sharedToFollowerClone
 	}
-	vfs.updateRootAndCWD(ctx, root, cwd, ns.root, newns.root)
-
-	queue := []cloneEntry{cloneEntry{ns.root, newns.root}}
-	for len(queue) != 0 {
-		p := queue[0]
-		queue = queue[1:]
-		for c := range p.prevMount.children {
-			m := vfs.cloneMount(c, c.root, nil)
-			vd := VirtualDentry{
-				mount:  p.parentMount,
-				dentry: c.point(),
-			}
-			vd.IncRef()
-
-			vds, err := vfs.connectMountAtLocked(ctx, m, vd)
-			m.DecRef(ctx)
-			vdsToDecRef = append(vdsToDecRef, vds...)
-			if err != nil {
-				newns.DecRef(ctx)
-				return nil, err
-			}
-			if c.propType == Shared {
-				vfs.addPeer(c, m)
-			}
-			vfs.updateRootAndCWD(ctx, root, cwd, c, m)
-			if len(c.children) != 0 {
-				queue = append(queue, cloneEntry{c, m})
-			}
-		}
+	newRoot, err := vfs.cloneMountTree(ctx, ns.root, ns.root.root, cloneType,
+		func(ctx context.Context, src, dst *Mount) {
+			vfs.updateRootAndCWD(ctx, root, cwd, src, dst) // +checklocksforce: vfs.mountMu is locked.
+		})
+	if err != nil {
+		newns.DecRef(ctx)
+		return nil, err
+	}
+	newns.root = newRoot
+	newns.root.ns = newns
+	vfs.commitChildren(ctx, newRoot)
+	if ns.Owner != newns.Owner {
+		vfs.lockMountTree(newRoot)
 	}
 	return newns, nil
 }
@@ -218,19 +197,11 @@ func (vfs *VirtualFilesystem) CloneMountNamespace(
 // Destroy implements nsfs.Namespace.Destroy.
 func (mntns *MountNamespace) Destroy(ctx context.Context) {
 	vfs := mntns.root.fs.VirtualFilesystem()
-	vfs.mountMu.Lock()
-	vfs.mounts.seq.BeginWrite()
-	vdsToDecRef, mountsToDecRef := vfs.umountRecursiveLocked(mntns.root, &umountRecursiveOptions{
+	vfs.lockMounts()
+	vfs.umountTreeLocked(mntns.root, &umountRecursiveOptions{
 		disconnectHierarchy: true,
-	}, nil, nil)
-	vfs.mounts.seq.EndWrite()
-	vfs.mountMu.Unlock()
-	for _, vd := range vdsToDecRef {
-		vd.DecRef(ctx)
-	}
-	for _, mnt := range mountsToDecRef {
-		mnt.DecRef(ctx)
-	}
+	})
+	vfs.unlockMounts(ctx)
 }
 
 // Type implements nsfs.Namespace.Type.
@@ -253,12 +224,40 @@ func (mntns *MountNamespace) TryIncRef() bool {
 	return mntns.Refs.TryIncRef()
 }
 
-// Root returns mntns' root. It does not take a reference on the returned
-// Dentry.
-func (mntns *MountNamespace) Root() VirtualDentry {
+// Root returns mntns' root. If the root is over-mounted, it returns the top
+// mount.
+func (mntns *MountNamespace) Root(ctx context.Context) VirtualDentry {
+	vfs := mntns.root.fs.VirtualFilesystem()
 	vd := VirtualDentry{
 		mount:  mntns.root,
 		dentry: mntns.root.root,
 	}
+	vd.IncRef()
+	if !vd.dentry.isMounted() {
+		return vd
+	}
+	m := vfs.getMountAt(ctx, vd.mount, vd.dentry)
+	if m == nil {
+		return vd
+	}
+	vd.DecRef(ctx)
+	vd.mount = m
+	vd.dentry = m.root
+	vd.dentry.IncRef()
 	return vd
+}
+
+func (mntns *MountNamespace) checkMountCount(ctx context.Context, mnt *Mount) error {
+	if mntns.mounts > MountMax {
+		return linuxerr.ENOSPC
+	}
+	if mntns.mounts+mntns.pending > MountMax {
+		return linuxerr.ENOSPC
+	}
+	mnts := mnt.countSubmountsLocked()
+	if mntns.mounts+mntns.pending+mnts > MountMax {
+		return linuxerr.ENOSPC
+	}
+	mntns.pending += mnts
+	return nil
 }

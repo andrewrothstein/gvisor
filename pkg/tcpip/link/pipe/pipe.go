@@ -42,12 +42,14 @@ func New(linkAddr1, linkAddr2 tcpip.LinkAddress, mtu uint32) (*Endpoint, *Endpoi
 }
 
 // Endpoint is one end of a pipe.
+//
+// +stateify savable
 type Endpoint struct {
 	linked   *Endpoint
 	linkAddr tcpip.LinkAddress
 	mtu      uint32
 
-	mu sync.RWMutex
+	mu sync.RWMutex `state:"nosave"`
 	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
 }
@@ -122,7 +124,7 @@ func (*Endpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.
-func (*Endpoint) AddHeader(stack.PacketBufferPtr) {}
+func (*Endpoint) AddHeader(*stack.PacketBuffer) {}
 
 // ParseHeader implements stack.LinkEndpoint.
-func (*Endpoint) ParseHeader(stack.PacketBufferPtr) bool { return true }
+func (*Endpoint) ParseHeader(*stack.PacketBuffer) bool { return true }

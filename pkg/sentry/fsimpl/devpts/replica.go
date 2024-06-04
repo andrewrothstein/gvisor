@@ -76,7 +76,7 @@ func (ri *replicaInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kern
 }
 
 // Valid implements kernfs.Inode.Valid.
-func (ri *replicaInode) Valid(context.Context) bool {
+func (ri *replicaInode) Valid(context.Context, *kernfs.Dentry, string) bool {
 	// Return valid if the replica still exists.
 	ri.root.mu.Lock()
 	defer ri.root.mu.Unlock()
@@ -169,6 +169,10 @@ func (rfd *replicaFileDescription) Ioctl(ctx context.Context, io usermem.IO, sys
 		return rfd.inode.t.ld.setTermios(t, args)
 	case linux.TCSETSW:
 		// TODO(b/29356795): This should drain the output queue first.
+		return rfd.inode.t.ld.setTermios(t, args)
+	case linux.TCSETSF:
+		// TODO(b/29356795): This should drain the output queue and
+		// clear the input queue first.
 		return rfd.inode.t.ld.setTermios(t, args)
 	case linux.TIOCGPTN:
 		nP := primitive.Uint32(rfd.inode.t.n)

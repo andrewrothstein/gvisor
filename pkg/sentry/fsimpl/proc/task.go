@@ -90,6 +90,8 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 	}
 	if isThreadGroup {
 		contents["task"] = fs.newSubtasks(ctx, task, pidns, fakeCgroupControllers)
+	} else {
+		contents["children"] = fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &childrenData{task: task, pidns: pidns})
 	}
 	if len(fakeCgroupControllers) > 0 {
 		contents["cgroup"] = fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, newFakeCgroupData(fakeCgroupControllers))
@@ -114,7 +116,7 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 // Valid implements kernfs.Inode.Valid. This inode remains valid as long
 // as the task is still running. When it's dead, another tasks with the same
 // PID could replace it.
-func (i *taskInode) Valid(ctx context.Context) bool {
+func (i *taskInode) Valid(ctx context.Context, parent *kernfs.Dentry, name string) bool {
 	return i.task.ExitState() != kernel.TaskExitDead
 }
 
@@ -167,8 +169,8 @@ func (fs *filesystem) newTaskOwnedDir(ctx context.Context, task *kernel.Task, in
 	return &taskOwnedInode{Inode: dir, owner: task}
 }
 
-func (i *taskOwnedInode) Valid(ctx context.Context) bool {
-	return i.owner.ExitState() != kernel.TaskExitDead && i.Inode.Valid(ctx)
+func (i *taskOwnedInode) Valid(ctx context.Context, parent *kernfs.Dentry, name string) bool {
+	return i.owner.ExitState() != kernel.TaskExitDead && i.Inode.Valid(ctx, parent, name)
 }
 
 // Stat implements kernfs.Inode.Stat.

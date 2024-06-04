@@ -32,10 +32,12 @@ var _ stack.NetworkDispatcher = (*Endpoint)(nil)
 var _ stack.LinkEndpoint = (*Endpoint)(nil)
 
 // Endpoint is a waitable link-layer endpoint.
+//
+// +stateify savable
 type Endpoint struct {
 	dispatchGate sync.Gate
 
-	mu sync.RWMutex
+	mu sync.RWMutex `state:"nosave"`
 	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
 
@@ -56,7 +58,7 @@ func New(lower stack.LinkEndpoint) *Endpoint {
 // It is called by the link-layer endpoint being wrapped when a packet arrives,
 // and only forwards to the actual dispatcher if Wait or WaitDispatch haven't
 // been called.
-func (e *Endpoint) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+func (e *Endpoint) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	if !e.dispatchGate.Enter() {
 		return
 	}
@@ -70,7 +72,7 @@ func (e *Endpoint) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pk
 }
 
 // DeliverLinkPacket implements stack.NetworkDispatcher.
-func (e *Endpoint) DeliverLinkPacket(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+func (e *Endpoint) DeliverLinkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	if !e.dispatchGate.Enter() {
 		return
 	}
@@ -158,11 +160,11 @@ func (e *Endpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (e *Endpoint) AddHeader(pkt stack.PacketBufferPtr) {
+func (e *Endpoint) AddHeader(pkt *stack.PacketBuffer) {
 	e.lower.AddHeader(pkt)
 }
 
 // ParseHeader implements stack.LinkEndpoint.ParseHeader.
-func (e *Endpoint) ParseHeader(pkt stack.PacketBufferPtr) bool {
+func (e *Endpoint) ParseHeader(pkt *stack.PacketBuffer) bool {
 	return e.lower.ParseHeader(pkt)
 }
