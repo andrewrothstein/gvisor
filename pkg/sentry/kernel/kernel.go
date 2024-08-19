@@ -160,6 +160,7 @@ type Kernel struct {
 	useHostCores         bool
 	extraAuxv            []arch.AuxEntry
 	vdso                 *loader.VDSO
+	vdsoParams           *VDSOParamPage
 	rootUTSNamespace     *UTSNamespace
 	rootIPCNamespace     *IPCNamespace
 
@@ -357,6 +358,40 @@ type Kernel struct {
 	// Mapping: cid -> name.
 	// It's protected by extMu.
 	containerNames map[string]string
+
+	// checkpointMu is used to protect the checkpointing related fields below.
+	checkpointMu sync.Mutex `state:"nosave"`
+
+	// checkpointCond is used to wait for a checkpoint to complete. It uses
+	// checkpointMu as its mutex.
+	checkpointCond sync.Cond `state:"nosave"`
+
+	// additionalCheckpointState stores additional state that needs
+	// to be checkpointed. It's protected by checkpointMu.
+	additionalCheckpointState map[any]any
+
+	// saver implements the Saver interface, which (as of writing) supports
+	// asynchronous checkpointing. It's protected by checkpointMu.
+	saver Saver `state:"nosave"`
+
+	// checkpointCounter aims to track the number of times the kernel has been
+	// successfully checkpointed. It's updated via calls to OnCheckpointAttempt()
+	// and IncCheckpointCount(). Kernel checkpoint-ers must call these methods
+	// appropriately so the counter is accurate. It's protected by checkpointMu.
+	checkpointCounter uint32
+
+	// lastCheckpointStatus is the error value returned from the most recent
+	// checkpoint attempt. If this value is nil, then the `checkpointCounter`-th
+	// checkpoint attempt succeeded and no checkpoint attempt has completed since.
+	// If this value is non-nil, then the `checkpointCounter`-th checkpoint
+	// attempt succeeded, after which at least one more checkpoint attempt was
+	// made and failed with this error. It's protected by checkpointMu.
+	lastCheckpointStatus error `state:"nosave"`
+}
+
+// Saver is an interface for saving the kernel.
+type Saver interface {
+	SaveAsync() error
 }
 
 // InitKernelArgs holds arguments to Init.
@@ -392,6 +427,9 @@ type InitKernelArgs struct {
 
 	// Vdso holds the VDSO and its parameter page.
 	Vdso *loader.VDSO
+
+	// VdsoParams is the VDSO parameter page manager.
+	VdsoParams *VDSOParamPage
 
 	// RootUTSNamespace is the root UTS namespace.
 	RootUTSNamespace *UTSNamespace
@@ -437,6 +475,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 		k.rootNetworkNamespace = inet.NewRootNamespace(nil, nil, args.RootUserNamespace)
 	}
 	k.runningTasksCond.L = &k.runningTasksMu
+	k.checkpointCond.L = &k.checkpointMu
 	k.cpuClockTickerWakeCh = make(chan struct{}, 1)
 	k.cpuClockTickerStopCond.L = &k.runningTasksMu
 	k.applicationCores = args.ApplicationCores
@@ -454,6 +493,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	}
 	k.extraAuxv = args.ExtraAuxv
 	k.vdso = args.Vdso
+	k.vdsoParams = args.VdsoParams
 	k.futexes = futex.NewManager()
 	k.netlinkPorts = port.New()
 	k.ptraceExceptions = make(map[*Task]*Task)
@@ -720,6 +760,7 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, pagesMetadata, pages
 	}
 
 	k.runningTasksCond.L = &k.runningTasksMu
+	k.checkpointCond.L = &k.checkpointMu
 	k.cpuClockTickerWakeCh = make(chan struct{}, 1)
 	k.cpuClockTickerStopCond.L = &k.runningTasksMu
 
@@ -765,7 +806,7 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, pagesMetadata, pages
 	// Restore the root network stack.
 	k.rootNetworkNamespace.RestoreRootStack(net)
 
-	k.Timekeeper().SetClocks(clocks)
+	k.Timekeeper().SetClocks(clocks, k.vdsoParams)
 
 	if timeReady != nil {
 		close(timeReady)
@@ -1215,7 +1256,7 @@ func (k *Kernel) pauseTimeLocked(ctx context.Context) {
 		// This means we'll iterate FDTables shared by multiple tasks repeatedly,
 		// but ktime.Timer.Pause is idempotent so this is harmless.
 		if t.fdTable != nil {
-			t.fdTable.forEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) bool {
+			t.fdTable.ForEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) bool {
 				if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
 					tfd.PauseTimer()
 				}
@@ -1237,7 +1278,7 @@ func (k *Kernel) resumeTimeLocked(ctx context.Context) {
 	// The CPU clock ticker will automatically resume as task goroutines resume
 	// execution.
 
-	k.timekeeper.ResumeUpdates()
+	k.timekeeper.ResumeUpdates(k.vdsoParams)
 	for t := range k.tasks.Root.tids {
 		if t == t.tg.leader {
 			t.tg.itimerRealTimer.Resume()
@@ -1246,7 +1287,7 @@ func (k *Kernel) resumeTimeLocked(ctx context.Context) {
 			}
 		}
 		if t.fdTable != nil {
-			t.fdTable.forEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) bool {
+			t.fdTable.ForEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) bool {
 				if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
 					tfd.ResumeTimer()
 				}
@@ -1329,9 +1370,15 @@ func (k *Kernel) decRunningTasks() {
 	// active without an expensive transition.
 }
 
-// WaitExited blocks until all tasks in k have exited.
+// WaitExited blocks until all tasks in k have exited. No tasks can be created
+// after WaitExited returns.
 func (k *Kernel) WaitExited() {
-	k.tasks.liveGoroutines.Wait()
+	k.tasks.mu.Lock()
+	defer k.tasks.mu.Unlock()
+	k.tasks.noNewTasksIfZeroLive = true
+	for k.tasks.liveTasks != 0 {
+		k.tasks.zeroLiveTasksCond.Wait()
+	}
 }
 
 // Kill requests that all tasks in k immediately exit as if group exiting with
@@ -1352,6 +1399,11 @@ func (k *Kernel) Pause() {
 	k.extMu.Unlock()
 	k.tasks.runningGoroutines.Wait()
 	k.tasks.aioGoroutines.Wait()
+}
+
+// IsPaused returns true if the kernel is currently paused.
+func (k *Kernel) IsPaused() bool {
+	return k.tasks.isExternallyStopped()
 }
 
 // ReceiveTaskStates receives full states for all tasks.
@@ -1797,6 +1849,28 @@ func (k *Kernel) SetHostMount(mnt *vfs.Mount) {
 	k.hostMount = mnt
 }
 
+// AddStateToCheckpoint adds a key-value pair to be additionally checkpointed.
+func (k *Kernel) AddStateToCheckpoint(key, v any) {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	if k.additionalCheckpointState == nil {
+		k.additionalCheckpointState = make(map[any]any)
+	}
+	k.additionalCheckpointState[key] = v
+}
+
+// PopCheckpointState pops a key-value pair from the additional checkpoint
+// state. If the key doesn't exist, nil is returned.
+func (k *Kernel) PopCheckpointState(key any) any {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	if v, ok := k.additionalCheckpointState[key]; ok {
+		delete(k.additionalCheckpointState, key)
+		return v
+	}
+	return nil
+}
+
 // HostMount returns the hostfs mount.
 func (k *Kernel) HostMount() *vfs.Mount {
 	return k.hostMount
@@ -1879,6 +1953,7 @@ func (k *Kernel) Release() {
 	k.rootIPCNamespace.DecRef(ctx)
 	k.rootUTSNamespace.DecRef(ctx)
 	k.cleaupDevGofers()
+	k.mf.Destroy()
 }
 
 // PopulateNewCgroupHierarchy moves all tasks into a newly created cgroup
@@ -2054,4 +2129,80 @@ func (k *Kernel) ContainerName(cid string) string {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
 	return k.containerNames[cid]
+}
+
+// SetSaver sets the kernel's Saver.
+// Thread-compatible.
+func (k *Kernel) SetSaver(s Saver) {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	k.saver = s
+}
+
+// Saver returns the kernel's Saver.
+// Thread-compatible.
+func (k *Kernel) Saver() Saver {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	return k.saver
+}
+
+// IncCheckpointCount increments the checkpoint counter.
+func (k *Kernel) IncCheckpointCount() {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	k.checkpointCounter++
+}
+
+// CheckpointCount returns the current checkpoint count. Note that the result
+// may be stale by the time the caller uses it.
+func (k *Kernel) CheckpointCount() uint32 {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	return k.checkpointCounter
+}
+
+// OnCheckpointAttempt is called when a checkpoint attempt is completed. err is
+// any checkpoint errors that may have occurred.
+func (k *Kernel) OnCheckpointAttempt(err error) {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	if err == nil {
+		k.checkpointCounter++
+	}
+	k.lastCheckpointStatus = err
+	k.checkpointCond.Broadcast()
+}
+
+// ResetCheckpointStatus resets the last checkpoint status, indicating a new
+// checkpoint is in progress. Caller must call OnCheckpointAttempt when the
+// checkpoint attempt is completed.
+func (k *Kernel) ResetCheckpointStatus() {
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	k.lastCheckpointStatus = nil
+}
+
+// WaitCheckpoint waits for the Kernel to have been successfully checkpointed
+// n-1 times, then waits for either the n-th successful checkpoint (in which
+// case it returns nil) or any number of failed checkpoints (in which case it
+// returns an error returned by any such failure).
+func (k *Kernel) WaitCheckpoint(n uint32) error {
+	if n == 0 {
+		return nil
+	}
+	k.checkpointMu.Lock()
+	defer k.checkpointMu.Unlock()
+	if k.checkpointCounter >= n {
+		// n-th checkpoint already completed successfully.
+		return nil
+	}
+	for k.checkpointCounter < n {
+		if k.checkpointCounter == n-1 && k.lastCheckpointStatus != nil {
+			// n-th checkpoint was attempted but it had failed.
+			return k.lastCheckpointStatus
+		}
+		k.checkpointCond.Wait()
+	}
+	return nil
 }

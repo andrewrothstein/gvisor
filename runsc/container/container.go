@@ -47,8 +47,10 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
 	"gvisor.dev/gvisor/runsc/donation"
+	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/sandbox"
 	"gvisor.dev/gvisor/runsc/specutils"
+	"gvisor.dev/gvisor/runsc/starttime"
 )
 
 const cgroupParentAnnotation = "dev.gvisor.spec.cgroup-parent"
@@ -241,6 +243,9 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	// Lock the container metadata file to prevent concurrent creations of
 	// containers with the same id.
 	if err := c.Saver.LockForNew(); err != nil {
+		// As we have not allocated any resources yet, we revoke the clean-up operation.
+		// Otherwise, we may accidently destroy an existing container.
+		cu.Release()
 		return nil, fmt.Errorf("cannot lock container metadata file: %w", err)
 	}
 	defer c.Saver.UnlockOrDie()
@@ -649,6 +654,18 @@ func (c *Container) WaitPID(pid int32) (unix.WaitStatus, error) {
 		return 0, fmt.Errorf("sandbox is not running")
 	}
 	return c.Sandbox.WaitPID(c.ID, pid)
+}
+
+// WaitCheckpoint waits for the Kernel to have been successfully checkpointed
+// n-1 times, then waits for either the n-th successful checkpoint (in which
+// case it returns nil) or any number of failed checkpoints (in which case it
+// returns an error returned by any such failure).
+func (c *Container) WaitCheckpoint(n uint32) error {
+	log.Debugf("Wait on %d-th checkpoint to complete in container, cid: %s", n, c.ID)
+	if !c.IsSandboxRunning() {
+		return fmt.Errorf("sandbox is not running")
+	}
+	return c.Sandbox.WaitCheckpoint(n)
 }
 
 // SignalContainer sends the signal to the container. If all is true and signal
@@ -1200,7 +1217,18 @@ func (c *Container) createGoferProcess(spec *specs.Spec, conf *config.Config, bu
 			}
 		}
 		if specutils.IsDebugCommand(conf, "gofer") {
-			if err := donations.DonateDebugLogFile("debug-log-fd", conf.DebugLog, "gofer", test); err != nil {
+			// The startTime here can mean one of two things:
+			// - If this is the first gofer started at the same time as the sandbox,
+			//   then this starttime will exactly match the one used by the sandbox
+			//   itself (i.e. `Sandbox.StartTime`). This is desirable, such that the
+			//   first gofer's log filename will have the exact same timestamp as
+			//   the sandbox's log filename timestamp.
+			// - If this is not the first gofer, then this starttime will be later
+			//   than the sandbox start time; this is desirable such that we can
+			//   distinguish the gofer log filenames between each other.
+			// In either case, `starttime.Get` gets us the timestamp we want.
+			startTime := starttime.Get()
+			if err := donations.DonateDebugLogFile("debug-log-fd", conf.DebugLog, "gofer", test, startTime); err != nil {
 				return nil, nil, nil, err
 			}
 		}
@@ -1701,6 +1729,7 @@ func (c *Container) donateGoferProfileFDs(conf *config.Config, donations *donati
 	// into a single file.
 	profSuffix := ".gofer." + c.ID
 	const profFlags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	profile.UpdatePaths(conf, starttime.Get())
 	if conf.ProfileBlock != "" {
 		if err := donations.OpenAndDonate("profile-block-fd", conf.ProfileBlock+profSuffix, profFlags); err != nil {
 			return err

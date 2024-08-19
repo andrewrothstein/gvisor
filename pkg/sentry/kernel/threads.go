@@ -76,12 +76,17 @@ type TaskSet struct {
 	// always reset to zero after restore.
 	stopCount int32 `state:"nosave"`
 
-	// liveGoroutines is the number of non-exited task goroutines in the
-	// TaskSet.
-	//
-	// liveGoroutines is not saved; it is reset as task goroutines are
-	// restarted by Task.Start.
-	liveGoroutines sync.WaitGroup `state:"nosave"`
+	// liveTasks is the number of tasks in the TaskSet whose goroutines have
+	// not exited. liveTasks is protected by mu.
+	liveTasks uint32
+
+	// If noNewTasksIfZeroLive is true and liveTasks is zero, calls to
+	// Kernel.NewTask() will fail. noNewTasksIfZeroLive is protected by mu.
+	noNewTasksIfZeroLive bool
+
+	// zeroLiveTasksCond is broadcast when liveTasks transitions from non-zero
+	// to zero.
+	zeroLiveTasksCond sync.Cond `state:"nosave"`
 
 	// runningGoroutines is the number of running task goroutines in the
 	// TaskSet.
@@ -102,8 +107,16 @@ type TaskSet struct {
 // newTaskSet returns a new, empty TaskSet.
 func newTaskSet(pidns *PIDNamespace) *TaskSet {
 	ts := &TaskSet{Root: pidns}
+	ts.zeroLiveTasksCond.L = &ts.mu
 	pidns.owner = ts
 	return ts
+}
+
+// ForEachThreadGroup applies f to each thread group in ts.
+func (ts *TaskSet) ForEachThreadGroup(f func(tg *ThreadGroup)) {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	ts.forEachThreadGroupLocked(f)
 }
 
 // forEachThreadGroupLocked applies f to each thread group in ts.

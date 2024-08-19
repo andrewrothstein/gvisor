@@ -70,7 +70,7 @@ func (p *Protocol) CanSend() bool {
 }
 
 // dumpLinks handles RTM_GETLINK dump requests.
-func (p *Protocol) dumpLinks(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+func (p *Protocol) dumpLinks(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
 	// NLM_F_DUMP + RTM_GETLINK messages are supposed to include an
 	// ifinfomsg. However, Linux <3.9 only checked for rtgenmsg, and some
 	// userspace applications (including glibc) still include rtgenmsg.
@@ -88,7 +88,7 @@ func (p *Protocol) dumpLinks(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.
 	// We always send back an NLMSG_DONE.
 	ms.Multi = true
 
-	stack := inet.StackFromContext(ctx)
+	stack := s.Stack()
 	if stack == nil {
 		// No network devices.
 		return nil
@@ -102,8 +102,8 @@ func (p *Protocol) dumpLinks(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.
 }
 
 // getLinks handles RTM_GETLINK requests.
-func (p *Protocol) getLink(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
-	stack := inet.StackFromContext(ctx)
+func (p *Protocol) getLink(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+	stack := s.Stack()
 	if stack == nil {
 		// No network devices.
 		return nil
@@ -162,8 +162,9 @@ func (p *Protocol) getLink(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.Me
 	return nil
 }
 
-func (p *Protocol) newLink(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
-	stack := inet.StackFromContext(ctx)
+// newLink handles RTM_NEWLINK reqeusts.
+func (p *Protocol) newLink(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+	stack := s.Stack()
 	if stack == nil {
 		// No network stack.
 		return syserr.ErrProtocolNotSupported
@@ -172,9 +173,24 @@ func (p *Protocol) newLink(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.Me
 	return stack.SetInterface(ctx, msg)
 }
 
+// setLink handles RTM_SETLINK requests.
+func (p *Protocol) setLink(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+	stack := s.Stack()
+	if stack == nil {
+		// No network stack.
+		return syserr.ErrProtocolNotSupported
+	}
+
+	if msg.Header().Flags&linux.NLM_F_CREATE == linux.NLM_F_CREATE {
+		return syserr.ErrInvalidArgument
+	}
+
+	return stack.SetInterface(ctx, msg)
+}
+
 // delLink handles RTM_DELLINK requests.
-func (p *Protocol) delLink(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
-	stack := inet.StackFromContext(ctx)
+func (p *Protocol) delLink(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+	stack := s.Stack()
 	if stack == nil {
 		// No network stack.
 		return syserr.ErrProtocolNotSupported
@@ -243,7 +259,7 @@ func addNewLinkMessage(ms *nlmsg.MessageSet, idx int32, i inet.Interface) {
 }
 
 // dumpAddrs handles RTM_GETADDR dump requests.
-func (p *Protocol) dumpAddrs(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+func (p *Protocol) dumpAddrs(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
 	// RTM_GETADDR dump requests need not contain anything more than the
 	// netlink header and 1 byte protocol family common to all
 	// NETLINK_ROUTE requests.
@@ -257,7 +273,7 @@ func (p *Protocol) dumpAddrs(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.
 	// We always send back an NLMSG_DONE.
 	ms.Multi = true
 
-	stack := inet.StackFromContext(ctx)
+	stack := s.Stack()
 	if stack == nil {
 		// No network devices.
 		return nil
@@ -381,13 +397,27 @@ func parseForDestination(msg *nlmsg.Message) ([]byte, *syserr.Error) {
 	return nil, syserr.ErrInvalidArgument
 }
 
+// newRoute handles RTM_NEWROUTE requests.
+func (p *Protocol) newRoute(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+	stack := s.Stack()
+	if stack == nil {
+		// No network routes.
+		return syserr.ErrProtocolNotSupported
+	}
+
+	if msg.Header().Flags&linux.NLM_F_REQUEST != linux.NLM_F_REQUEST {
+		return syserr.ErrProtocolNotSupported
+	}
+	return stack.NewRoute(ctx, msg)
+}
+
 // dumpRoutes handles RTM_GETROUTE requests.
-func (p *Protocol) dumpRoutes(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+func (p *Protocol) dumpRoutes(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
 	// RTM_GETROUTE dump requests need not contain anything more than the
 	// netlink header and 1 byte protocol family common to all
 	// NETLINK_ROUTE requests.
 
-	stack := inet.StackFromContext(ctx)
+	stack := s.Stack()
 	if stack == nil {
 		// No network routes.
 		return nil
@@ -457,8 +487,8 @@ func (p *Protocol) dumpRoutes(ctx context.Context, msg *nlmsg.Message, ms *nlmsg
 }
 
 // newAddr handles RTM_NEWADDR requests.
-func (p *Protocol) newAddr(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
-	stack := inet.StackFromContext(ctx)
+func (p *Protocol) newAddr(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+	stack := s.Stack()
 	if stack == nil {
 		// No network stack.
 		return syserr.ErrProtocolNotSupported
@@ -499,7 +529,12 @@ func (p *Protocol) newAddr(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.Me
 				return syserr.ErrInvalidArgument
 			}
 		case linux.IFA_ADDRESS:
+		case linux.IFA_BROADCAST:
+			// TODO(b/340929168): support IFA_BROADCAST. The standard
+			// broadcast address (the last IP address of the subnet) is
+			// used by default.
 		default:
+			ctx.Warningf("Unknown attribute: %v", ahdr.Type)
 			return syserr.ErrNotSupported
 		}
 	}
@@ -507,8 +542,8 @@ func (p *Protocol) newAddr(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.Me
 }
 
 // delAddr handles RTM_DELADDR requests.
-func (p *Protocol) delAddr(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
-	stack := inet.StackFromContext(ctx)
+func (p *Protocol) delAddr(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+	stack := s.Stack()
 	if stack == nil {
 		// No network stack.
 		return syserr.ErrProtocolNotSupported
@@ -553,7 +588,7 @@ func (p *Protocol) delAddr(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.Me
 }
 
 // ProcessMessage implements netlink.Protocol.ProcessMessage.
-func (p *Protocol) ProcessMessage(ctx context.Context, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
+func (p *Protocol) ProcessMessage(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
 	hdr := msg.Header()
 
 	// All messages start with a 1 byte protocol family.
@@ -577,28 +612,33 @@ func (p *Protocol) ProcessMessage(ctx context.Context, msg *nlmsg.Message, ms *n
 		// supported.
 		switch hdr.Type {
 		case linux.RTM_GETLINK:
-			return p.dumpLinks(ctx, msg, ms)
+			return p.dumpLinks(ctx, s, msg, ms)
 		case linux.RTM_GETADDR:
-			return p.dumpAddrs(ctx, msg, ms)
+			return p.dumpAddrs(ctx, s, msg, ms)
 		case linux.RTM_GETROUTE:
-			return p.dumpRoutes(ctx, msg, ms)
+			return p.dumpRoutes(ctx, s, msg, ms)
 		default:
 			return syserr.ErrNotSupported
 		}
 	} else if hdr.Flags&linux.NLM_F_REQUEST == linux.NLM_F_REQUEST {
 		switch hdr.Type {
 		case linux.RTM_NEWLINK:
-			return p.newLink(ctx, msg, ms)
+			return p.newLink(ctx, s, msg, ms)
 		case linux.RTM_GETLINK:
-			return p.getLink(ctx, msg, ms)
+			return p.getLink(ctx, s, msg, ms)
 		case linux.RTM_DELLINK:
-			return p.delLink(ctx, msg, ms)
+			return p.delLink(ctx, s, msg, ms)
+		case linux.RTM_SETLINK:
+			// RTM_NEWLINK is backward compatible to RTM_SETLINK.
+			return p.setLink(ctx, s, msg, ms)
+		case linux.RTM_NEWROUTE:
+			return p.newRoute(ctx, s, msg, ms)
 		case linux.RTM_GETROUTE:
-			return p.dumpRoutes(ctx, msg, ms)
+			return p.dumpRoutes(ctx, s, msg, ms)
 		case linux.RTM_NEWADDR:
-			return p.newAddr(ctx, msg, ms)
+			return p.newAddr(ctx, s, msg, ms)
 		case linux.RTM_DELADDR:
-			return p.delAddr(ctx, msg, ms)
+			return p.delAddr(ctx, s, msg, ms)
 		default:
 			return syserr.ErrNotSupported
 		}

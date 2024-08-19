@@ -379,6 +379,9 @@ type InternalFilesystemOptions struct {
 
 	// If OpenSocketsByConnecting is true, silently translate attempts to open
 	// files identifying as sockets to connect RPCs.
+	//
+	// TODO(b/354724938): Remove this option once there are no callers who
+	// rely on this behavior.
 	OpenSocketsByConnecting bool
 }
 
@@ -995,6 +998,11 @@ type dentry struct {
 	// same underlying file (see the gofer filesystem section fo vfs/inotify.md for
 	// a more in-depth discussion on this matter).
 	watches vfs.Watches
+
+	// forMountpoint marks directories that were created for mount points during
+	// container startup. This is used during restore, in case these mount points
+	// need to be recreated.
+	forMountpoint bool
 
 	// impl is the specific dentry implementation for non-synthetic dentries.
 	// impl is immutable.

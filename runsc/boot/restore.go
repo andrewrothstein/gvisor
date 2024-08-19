@@ -128,25 +128,13 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
 	return nil
 }
 
-func createNetworkNamespaceForRestore(l *Loader) (*stack.Stack, *inet.Namespace, error) {
-	creds := getRootCredentials(l.root.spec, l.root.conf, nil /* UserNamespace */)
-	if creds == nil {
-		return nil, nil, fmt.Errorf("getting root credentials")
-	}
-
+func createNetworkStackForRestore(l *Loader) (*stack.Stack, inet.Stack) {
 	// Save the current network stack to slap on top of the one that was restored.
 	curNetwork := l.k.RootNetworkNamespace().Stack()
-	eps, ok := curNetwork.(*netstack.Stack)
-	if !ok {
-		return nil, inet.NewRootNamespace(hostinet.NewStack(), nil, creds.UserNamespace), nil
+	if eps, ok := curNetwork.(*netstack.Stack); ok {
+		return eps.Stack, curNetwork
 	}
-
-	creator := &sandboxNetstackCreator{
-		clock:                    l.k.Timekeeper(),
-		uniqueID:                 l.k,
-		allowPacketEndpointWrite: l.root.conf.AllowPacketEndpointWrite,
-	}
-	return eps.Stack, inet.NewRootNamespace(curNetwork, creator, creds.UserNamespace), nil
+	return nil, hostinet.NewStack()
 }
 
 func (r *restorer) restore(l *Loader) error {
@@ -154,10 +142,7 @@ func (r *restorer) restore(l *Loader) error {
 
 	// Create a new root network namespace with the network stack of the
 	// old kernel to preserve the existing network configuration.
-	oldStack, netns, err := createNetworkNamespaceForRestore(l)
-	if err != nil {
-		return fmt.Errorf("creating network: %w", err)
-	}
+	oldStack, oldInetStack := createNetworkStackForRestore(l)
 
 	// Reset the network stack in the network namespace to nil before
 	// replacing the kernel. This will not free the network stack when this
@@ -180,7 +165,7 @@ func (r *restorer) restore(l *Loader) error {
 		Platform: p,
 	}
 
-	mf, err := createMemoryFile()
+	mf, err := createMemoryFile(l.root.conf.AppHugePages, l.hostShmemHuge)
 	if err != nil {
 		return fmt.Errorf("creating memory file: %v", err)
 	}
@@ -203,6 +188,12 @@ func (r *restorer) restore(l *Loader) error {
 	if oldStack != nil {
 		ctx = context.WithValue(ctx, stack.CtxRestoreStack, oldStack)
 	}
+
+	l.mu.Lock()
+	cu := cleanup.Make(func() {
+		l.mu.Unlock()
+	})
+	defer cu.Clean()
 
 	fdmap := make(map[vfs.RestoreID]int)
 	mfmap := make(map[string]*pgalloc.MemoryFile)
@@ -231,7 +222,7 @@ func (r *restorer) restore(l *Loader) error {
 
 	// Load the state.
 	loadOpts := state.LoadOpts{Source: r.stateFile, PagesMetadata: r.pagesMetadata, PagesFile: r.pagesFile}
-	if err := loadOpts.Load(ctx, l.k, nil, netns.Stack(), time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}); err != nil {
+	if err := loadOpts.Load(ctx, l.k, nil, oldInetStack, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}); err != nil {
 		return err
 	}
 
@@ -246,14 +237,7 @@ func (r *restorer) restore(l *Loader) error {
 	l.watchdog = dog
 	l.root.procArgs = kernel.CreateProcessArgs{}
 	l.restore = true
-
 	l.sandboxID = l.root.cid
-
-	l.mu.Lock()
-	cu := cleanup.Make(func() {
-		l.mu.Unlock()
-	})
-	defer cu.Clean()
 
 	// Update all tasks in the system with their respective new container IDs.
 	for _, task := range l.k.TaskSet().Root.Tasks() {
@@ -292,9 +276,17 @@ func (r *restorer) restore(l *Loader) error {
 
 	l.k.RestoreContainerMapping(l.containerIDs)
 
+	if err := l.kernelInitExtra(); err != nil {
+		return err
+	}
+
+	// Refresh the control server with the newly created kernel.
+	l.ctrl.refreshHandlers()
+
 	// Release `l.mu` before calling into callbacks.
 	cu.Clean()
 
+	// r.restoreDone() signals and waits for the sandbox to start.
 	if err := r.restoreDone(); err != nil {
 		return err
 	}
@@ -303,12 +295,29 @@ func (r *restorer) restore(l *Loader) error {
 	if r.pagesFile != nil {
 		r.pagesFile.Close()
 	}
+	if r.pagesMetadata != nil {
+		r.pagesMetadata.Close()
+	}
 
+	if err := postRestoreImpl(l); err != nil {
+		return err
+	}
+
+	// Restore was successful, so increment the checkpoint count manually. The
+	// count was saved while the previous kernel was being saved and checkpoint
+	// success was unknown at that time. Now we know the checkpoint succeeded.
+	l.k.IncCheckpointCount()
 	log.Infof("Restore successful")
 	return nil
 }
 
-func (l *Loader) save(o *control.SaveOpts) error {
+func (l *Loader) save(o *control.SaveOpts) (err error) {
+	defer func() {
+		// This closure is required to capture the final value of err.
+		l.k.OnCheckpointAttempt(err)
+	}()
+	l.k.ResetCheckpointStatus()
+
 	// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
 	if l.root.conf.Network == config.NetworkHost {
 		return errors.New("checkpoint not supported when using hostinet")
@@ -319,10 +328,22 @@ func (l *Loader) save(o *control.SaveOpts) error {
 	}
 	o.Metadata["container_count"] = strconv.Itoa(l.containerCount())
 
+	if err := preSaveImpl(l, o); err != nil {
+		return err
+	}
+
 	state := control.State{
 		Kernel:   l.k,
 		Watchdog: l.watchdog,
 	}
+	if err := state.Save(o, nil); err != nil {
+		return err
+	}
 
-	return state.Save(o, nil)
+	if o.Resume {
+		if err := postResumeImpl(l); err != nil {
+			return err
+		}
+	}
+	return nil
 }

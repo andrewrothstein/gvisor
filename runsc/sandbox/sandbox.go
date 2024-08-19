@@ -60,7 +60,9 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
 	"gvisor.dev/gvisor/runsc/donation"
+	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
+	"gvisor.dev/gvisor/runsc/starttime"
 )
 
 const (
@@ -73,13 +75,17 @@ const (
 	namespaceAnnotation = "io.kubernetes.cri.sandbox-namespace"
 )
 
+func controlSocketName(id string) string {
+	return fmt.Sprintf("runsc-%s.sock", id)
+}
+
 // createControlSocket finds a location and creates the socket used to
 // communicate with the sandbox. The socket is a UDS on the host filesystem.
 //
 // Note that abstract sockets are *not* used, because any user can connect to
 // them. There is no file mode protecting abstract sockets.
 func createControlSocket(rootDir, id string) (string, int, error) {
-	name := fmt.Sprintf("runsc-%s.sock", id)
+	name := controlSocketName(id)
 
 	// Only use absolute paths to guarantee resolution from anywhere.
 	for _, dir := range []string{rootDir, "/var/run", "/run", "/tmp"} {
@@ -182,11 +188,21 @@ type Sandbox struct {
 
 	// ControlSocketPath is the path to the sandbox's uRPC server socket.
 	// Connections to the sandbox are made through this.
+	// DO NOT access this directly, use getControlSocketPath() instead.
 	ControlSocketPath string `json:"controlSocketPath"`
 
 	// MountHints provides extra information about container mounts that apply
 	// to the entire pod.
 	MountHints *boot.PodMountHints `json:"mountHints"`
+
+	// StartTime is the time the sandbox was started.
+	StartTime time.Time `json:"startTime"`
+
+	// rootDir is the same as config.Config.RootDir. It represents the runtime
+	// root directory being used by the current runsc invocation. It's not saved
+	// to json, because the RootDir can change across runsc invocations.
+	// Depending on the caller's mount namespace, the path can vary.
+	rootDir string `nojson:"true"`
 
 	// child is set if a sandbox process is a child of the current process.
 	//
@@ -285,6 +301,7 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 		MetricMetadata:      conf.MetricMetadata(),
 		MetricServerAddress: conf.MetricServer,
 		MountHints:          args.MountHints,
+		StartTime:           starttime.Get(),
 	}
 	if args.Spec != nil && args.Spec.Annotations != nil {
 		s.PodName = args.Spec.Annotations[podNameAnnotation]
@@ -475,10 +492,16 @@ func (s *Sandbox) Restore(conf *config.Config, cid string, imagePath string, dir
 			return fmt.Errorf("opening restore image file %q failed: %v", pagesMetadataFileName, err)
 		}
 		defer pmf.Close()
+
 		opt.HavePagesFile = true
 		opt.FilePayload.Files = append(opt.FilePayload.Files, pmf, pf)
+		log.Infof("Found page files for sandbox %q. Page metadata: %q, pages: %q", s.ID, pagesMetadataFileName, pagesFileName)
+
 	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("opening restore image file %q failed: %v", pagesFileName, err)
+		return fmt.Errorf("opening restore pages file %q failed: %v", pagesFileName, err)
+
+	} else {
+		log.Infof("Using single checkpoint file for sandbox %q", s.ID)
 	}
 
 	// If the platform needs a device FD we must pass it in.
@@ -672,9 +695,38 @@ func (s *Sandbox) PortForward(opts *boot.PortForwardOpts) error {
 	return nil
 }
 
+// SetRootDir sets the root directory from the current runsc invocation.
+func (s *Sandbox) SetRootDir(rootDir string) {
+	s.rootDir = rootDir
+}
+
+// getControlSocketPath gets the control socket path for the sandbox.
+func (s *Sandbox) getControlSocketPath() string {
+	err := unix.Access(s.ControlSocketPath, unix.F_OK)
+	if err == nil {
+		return s.ControlSocketPath
+	}
+	log.Infof("Failed to stat Sandbox.ControlSocketPath=%q: %v", s.ControlSocketPath, err)
+
+	// Try to find the control socket in s.RootDir (in case RootDir has changed).
+	if s.rootDir != "" {
+		path := filepath.Join(s.rootDir, controlSocketName(s.ID))
+		if unix.Access(path, unix.F_OK) == nil {
+			log.Infof("Found a control socket in RootDir=%q", s.rootDir)
+			return path
+		}
+	}
+
+	// No control socket found.
+	return ""
+}
+
 func (s *Sandbox) sandboxConnect() (*urpc.Client, error) {
 	log.Debugf("Connecting to sandbox %q", s.ID)
-	path := s.ControlSocketPath
+	path := s.getControlSocketPath()
+	if path == "" {
+		return nil, fmt.Errorf("no control socket found for sandbox %q", s.ID)
+	}
 	if len(path) >= linux.UnixPathMax {
 		// This is not an abstract socket path. It is a filesystem path.
 		// UDS connect fails when the len(socket path) >= UNIX_PATH_MAX. Instead
@@ -757,11 +809,11 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		}
 	}
 	if specutils.IsDebugCommand(conf, "boot") {
-		if err := donations.DonateDebugLogFile("debug-log-fd", conf.DebugLog, "boot", test); err != nil {
+		if err := donations.DonateDebugLogFile("debug-log-fd", conf.DebugLog, "boot", test, s.StartTime); err != nil {
 			return err
 		}
 	}
-	if err := donations.DonateDebugLogFile("panic-log-fd", conf.PanicLog, "panic", test); err != nil {
+	if err := donations.DonateDebugLogFile("panic-log-fd", conf.PanicLog, "panic", test, s.StartTime); err != nil {
 		return err
 	}
 	covFilename := conf.CoverageReport
@@ -769,7 +821,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		covFilename = os.Getenv("GO_COVERAGE_FILE")
 	}
 	if covFilename != "" && coverage.Available() {
-		if err := donations.DonateDebugLogFile("coverage-fd", covFilename, "cov", test); err != nil {
+		if err := donations.DonateDebugLogFile("coverage-fd", covFilename, "cov", test, s.StartTime); err != nil {
 			return err
 		}
 	}
@@ -799,6 +851,11 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	if !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
 		// Setting cmd.Env = nil causes cmd to inherit the current process's env.
 		cmd.Env = []string{}
+		// runsc-race with glibc needs to disable rseq.
+		glibcTunables := os.Getenv("GLIBC_TUNABLES")
+		if glibcTunables != "" {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("GLIBC_TUNABLES=%s", glibcTunables))
+		}
 	}
 
 	// If there is a gofer, sends all socket ends to the sandbox.
@@ -811,6 +868,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		return err
 	}
 	const profFlags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	profile.UpdatePaths(conf, s.StartTime)
 	if err := donations.OpenAndDonate("profile-block-fd", conf.ProfileBlock, profFlags); err != nil {
 		return err
 	}
@@ -849,6 +907,18 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		return err
 	}
 	donations.DonateAndClose("sink-fds", args.SinkFiles...)
+
+	if len(conf.TestOnlyAutosaveImagePath) != 0 {
+		files, err := createSaveFiles(conf.TestOnlyAutosaveImagePath, false, statefile.CompressionLevelFlateBestSpeed)
+		if err != nil {
+			return fmt.Errorf("failed to create auto save files: %w", err)
+		}
+		donations.DonateAndClose("save-fds", files...)
+	}
+
+	if err := createSandboxProcessExtra(conf, args, &donations); err != nil {
+		return err
+	}
 
 	gPlatform, err := platform.Lookup(conf.Platform)
 	if err != nil {
@@ -1077,7 +1147,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		donations.Donate("profiling-metrics-fd", stdios[1])
 		cmd.Args = append(cmd.Args, "--profiling-metrics-fd-lossy=true")
 	} else if conf.ProfilingMetricsLog != "" {
-		if err := donations.DonateDebugLogFile("profiling-metrics-fd", conf.ProfilingMetricsLog, "metrics", test); err != nil {
+		if err := donations.DonateDebugLogFile("profiling-metrics-fd", conf.ProfilingMetricsLog, "metrics", test, s.StartTime); err != nil {
 			return err
 		}
 		cmd.Args = append(cmd.Args, "--profiling-metrics-fd-lossy=false")
@@ -1248,6 +1318,15 @@ func (s *Sandbox) WaitPID(cid string, pid int32) (unix.WaitStatus, error) {
 	return ws, nil
 }
 
+// WaitCheckpoint waits for the Kernel to have been successfully checkpointed
+// n-1 times, then waits for either the n-th successful checkpoint (in which
+// case it returns nil) or any number of failed checkpoints (in which case it
+// returns an error returned by any such failure).
+func (s *Sandbox) WaitCheckpoint(n uint32) error {
+	log.Debugf("Waiting for %d-th checkpoint to complete in sandbox %q", n, s.ID)
+	return s.call(boot.ContMgrWaitCheckpoint, &n, nil)
+}
+
 // IsRootContainer returns true if the specified container ID belongs to the
 // root container.
 func (s *Sandbox) IsRootContainer(cid string) bool {
@@ -1259,9 +1338,10 @@ func (s *Sandbox) IsRootContainer(cid string) bool {
 func (s *Sandbox) destroy() error {
 	log.Debugf("Destroying sandbox %q", s.ID)
 	// Only delete the control file if it exists.
-	if len(s.ControlSocketPath) > 0 {
-		if err := os.Remove(s.ControlSocketPath); err != nil {
-			log.Warningf("failed to delete control socket file %q: %v", s.ControlSocketPath, err)
+	controlSocketPath := s.getControlSocketPath()
+	if len(controlSocketPath) > 0 {
+		if err := os.Remove(controlSocketPath); err != nil {
+			log.Warningf("failed to delete control socket file %q: %v", controlSocketPath, err)
 		}
 	}
 	pid := s.Pid.load()
@@ -1328,45 +1408,24 @@ func (s *Sandbox) SignalProcess(cid string, pid int32, sig unix.Signal, fgProces
 func (s *Sandbox) Checkpoint(cid string, imagePath string, direct bool, sfOpts statefile.Options, mfOpts pgalloc.SaveOpts) error {
 	log.Debugf("Checkpoint sandbox %q, statefile options %+v, MemoryFile options %+v", s.ID, sfOpts, mfOpts)
 
-	stateFilePath := filepath.Join(imagePath, boot.CheckpointStateFileName)
-	sf, err := os.OpenFile(stateFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
+	files, err := createSaveFiles(imagePath, direct, sfOpts.Compression)
 	if err != nil {
-		return fmt.Errorf("creating checkpoint state file %q: %w", stateFilePath, err)
+		return err
 	}
-	defer sf.Close()
+	defer func() {
+		for _, f := range files {
+			_ = f.Close()
+		}
+	}()
 
 	opt := control.SaveOpts{
 		Metadata:           sfOpts.WriteToMetadata(map[string]string{}),
 		MemoryFileSaveOpts: mfOpts,
 		FilePayload: urpc.FilePayload{
-			Files: []*os.File{sf},
+			Files: files,
 		},
-		Resume: sfOpts.Resume,
-	}
-
-	// When there is no compression, MemoryFile contents are page-aligned.
-	// It is beneficial to store them separately so certain optimizations can be
-	// applied during restore. See Restore().
-	if sfOpts.Compression == statefile.CompressionLevelNone {
-		pagesFilePath := filepath.Join(imagePath, boot.CheckpointPagesFileName)
-		pagesWriteFlags := os.O_CREATE | os.O_EXCL | os.O_RDWR
-		if direct {
-			// The writes will be page-aligned, so it can be opened with O_DIRECT.
-			pagesWriteFlags |= syscall.O_DIRECT
-		}
-		pf, err := os.OpenFile(pagesFilePath, pagesWriteFlags, 0644)
-		if err != nil {
-			return fmt.Errorf("creating checkpoint pages file %q: %w", pagesFilePath, err)
-		}
-		defer pf.Close()
-		pagesMetadataFilePath := filepath.Join(imagePath, boot.CheckpointPagesMetadataFileName)
-		pmf, err := os.OpenFile(pagesMetadataFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
-		if err != nil {
-			return fmt.Errorf("creating checkpoint pages metadata file %q: %w", pagesMetadataFilePath, err)
-		}
-		defer pmf.Close()
-		opt.FilePayload.Files = append(opt.FilePayload.Files, pmf, pf)
-		opt.HavePagesFile = true
+		HavePagesFile: len(files) > 1,
+		Resume:        sfOpts.Resume,
 	}
 
 	if err := s.call(boot.ContMgrCheckpoint, &opt, nil); err != nil {
@@ -1375,10 +1434,50 @@ func (s *Sandbox) Checkpoint(cid string, imagePath string, direct bool, sfOpts s
 	return nil
 }
 
+// createSaveFiles creates the files used by checkpoint to save the state. They are returned in
+// the following order: sentry state, page metadata, page file. This is the same order expected by
+// RPCs and argument passing to the sandbox.
+func createSaveFiles(path string, direct bool, compression statefile.CompressionLevel) ([]*os.File, error) {
+	var files []*os.File
+
+	stateFilePath := filepath.Join(path, boot.CheckpointStateFileName)
+	f, err := os.OpenFile(stateFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("creating checkpoint state file %q: %w", stateFilePath, err)
+	}
+	files = append(files, f)
+
+	// When there is no compression, MemoryFile contents are page-aligned.
+	// It is beneficial to store them separately so certain optimizations can be
+	// applied during restore. See Restore().
+	if compression == statefile.CompressionLevelNone {
+		pagesMetadataFilePath := filepath.Join(path, boot.CheckpointPagesMetadataFileName)
+		f, err = os.OpenFile(pagesMetadataFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
+		if err != nil {
+			return nil, fmt.Errorf("creating checkpoint pages metadata file %q: %w", pagesMetadataFilePath, err)
+		}
+		files = append(files, f)
+
+		pagesFilePath := filepath.Join(path, boot.CheckpointPagesFileName)
+		pagesWriteFlags := os.O_CREATE | os.O_EXCL | os.O_RDWR
+		if direct {
+			// The writes will be page-aligned, so it can be opened with O_DIRECT.
+			pagesWriteFlags |= syscall.O_DIRECT
+		}
+		f, err := os.OpenFile(pagesFilePath, pagesWriteFlags, 0644)
+		if err != nil {
+			return nil, fmt.Errorf("creating checkpoint pages file %q: %w", pagesFilePath, err)
+		}
+		files = append(files, f)
+	}
+
+	return files, nil
+}
+
 // Pause sends the pause call for a container in the sandbox.
 func (s *Sandbox) Pause(cid string) error {
 	log.Debugf("Pause sandbox %q", s.ID)
-	if err := s.call(boot.LifecyclePause, nil, nil); err != nil {
+	if err := s.call(boot.ContMgrPause, nil, nil); err != nil {
 		return fmt.Errorf("pausing container %q: %w", cid, err)
 	}
 	return nil
@@ -1387,7 +1486,7 @@ func (s *Sandbox) Pause(cid string) error {
 // Resume sends the resume call for a container in the sandbox.
 func (s *Sandbox) Resume(cid string) error {
 	log.Debugf("Resume sandbox %q", s.ID)
-	if err := s.call(boot.LifecycleResume, nil, nil); err != nil {
+	if err := s.call(boot.ContMgrResume, nil, nil); err != nil {
 		return fmt.Errorf("resuming container %q: %w", cid, err)
 	}
 	return nil

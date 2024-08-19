@@ -215,11 +215,7 @@ func (l *Lifecycle) StartContainer(args *StartContainerArgs, _ *uint32) error {
 		if uid != 0 || gid != 0 {
 			return fmt.Errorf("container spec specified both an explicit UID/GID and a user name, only one or the other may be provided")
 		}
-		var err error
-		uid, gid, err = user.GetExecUIDGIDFromUser(l.Kernel.SupervisorContext(), mntns, args.User)
-		if err != nil {
-			return fmt.Errorf("couldn't retrieve UID and GID for user %v, err: %v", args.User, err)
-		}
+		uid, gid = user.GetExecUIDGIDFromUser(l.Kernel.SupervisorContext(), mntns, args.User)
 	}
 
 	creds := auth.NewUserCredentials(
@@ -387,18 +383,6 @@ func (l *Lifecycle) reap(containerID string, tg *kernel.ThreadGroup) {
 		ContainerId: containerID,
 		ExitStatus:  uint32(tg.ExitStatus()),
 	})
-}
-
-// Pause pauses all tasks, blocking until they are stopped.
-func (l *Lifecycle) Pause(_, _ *struct{}) error {
-	l.Kernel.Pause()
-	return nil
-}
-
-// Resume resumes all tasks.
-func (l *Lifecycle) Resume(_, _ *struct{}) error {
-	l.Kernel.Unpause()
-	return nil
 }
 
 // Shutdown sends signal to destroy the sentry/sandbox.

@@ -842,6 +842,7 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 			if fs.opts.interop != InteropModeShared {
 				parent.incLinks()
 			}
+			child.forMountpoint = opts.ForSyntheticMountpoint
 			return child, nil
 		}
 
@@ -1165,6 +1166,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 
 // Precondition: fs.renameMu is locked.
 func (d *dentry) openSocketByConnecting(ctx context.Context, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
+	fsmetric.GoferOpensByConnecting.Increment()
 	if opts.Flags&linux.O_DIRECT != 0 {
 		return nil, linuxerr.EINVAL
 	}

@@ -21,6 +21,7 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"strings"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -132,18 +133,20 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		idata := opts.InternalData.(*InternalData)
 		productName = idata.ProductName
 		if idata.EnableTPUProxyPaths {
-			deviceToIommuGroup, err := pciDeviceIOMMUGroups(path.Join(idata.TestSysfsPathPrefix, iommuGroupSysPath))
+			deviceToIOMMUGroup, err := pciDeviceIOMMUGroups(path.Join(idata.TestSysfsPathPrefix, iommuGroupSysPath))
 			if err != nil {
 				return nil, nil, err
 			}
-			pciPath := path.Join(idata.TestSysfsPathPrefix, pciMainBusDevicePath)
-			pciMainBusSub, err := fs.mirrorPCIBusDeviceDir(ctx, creds, pciPath, deviceToIommuGroup)
+			sysDevicesPath := path.Join(idata.TestSysfsPathPrefix, sysDevicesMainPath)
+			sysDevicesSub, err := fs.mirrorSysDevicesDir(ctx, creds, sysDevicesPath, deviceToIOMMUGroup)
 			if err != nil {
 				return nil, nil, err
 			}
-			devicesSub["pci0000:00"] = fs.newDir(ctx, creds, defaultSysDirMode, pciMainBusSub)
+			for dir, sub := range sysDevicesSub {
+				devicesSub[dir] = sub
+			}
 
-			deviceDirs, err := fs.newDeviceClassDir(ctx, creds, []string{accelDevice, vfioDevice}, pciPath)
+			deviceDirs, err := fs.newDeviceClassDir(ctx, creds, []string{accelDevice, vfioDevice}, sysDevicesPath)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -151,7 +154,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			for tpuDeviceType, symlinkDir := range deviceDirs {
 				classSub[tpuDeviceType] = fs.newDir(ctx, creds, defaultSysDirMode, symlinkDir)
 			}
-			pciDevicesSub, err := fs.newBusPCIDevicesDir(ctx, creds, pciPath)
+			pciDevicesSub, err := fs.newBusPCIDevicesDir(ctx, creds, sysDevicesPath)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -201,14 +204,78 @@ func cpuDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs
 	k := kernel.KernelFromContext(ctx)
 	maxCPUCores := k.ApplicationCores()
 	children := map[string]kernfs.Inode{
-		"online":   fs.newCPUFile(ctx, creds, maxCPUCores, linux.FileMode(0444)),
-		"possible": fs.newCPUFile(ctx, creds, maxCPUCores, linux.FileMode(0444)),
-		"present":  fs.newCPUFile(ctx, creds, maxCPUCores, linux.FileMode(0444)),
+		"online":   fs.newCPUFile(ctx, creds, maxCPUCores, defaultSysMode),
+		"possible": fs.newCPUFile(ctx, creds, maxCPUCores, defaultSysMode),
+		"present":  fs.newCPUFile(ctx, creds, maxCPUCores, defaultSysMode),
 	}
+	// For consistency with /proc/cpuinfo, pretend all CPUs are in the same
+	// socket and each CPU is a distinct core.
+	fullMask := fullCPUMask(maxCPUCores) + "\n"
 	for i := uint(0); i < maxCPUCores; i++ {
-		children[fmt.Sprintf("cpu%d", i)] = fs.newDir(ctx, creds, linux.FileMode(0555), nil)
+		oneMask := oneCPUMask(i, maxCPUCores) + "\n"
+		children[fmt.Sprintf("cpu%d", i)] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"topology": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+				"core_cpus":       fs.newStaticFile(ctx, creds, defaultSysMode, oneMask),
+				"core_siblings":   fs.newStaticFile(ctx, creds, defaultSysMode, fullMask),
+				"package_cpus":    fs.newStaticFile(ctx, creds, defaultSysMode, fullMask),
+				"thread_siblings": fs.newStaticFile(ctx, creds, defaultSysMode, oneMask),
+			}),
+		})
 	}
 	return fs.newDir(ctx, creds, defaultSysDirMode, children)
+}
+
+// fullCPUMask returns a "hex format ASCII string", consistent with Linux's
+// include/linux/cpumask.h:cpumap_print_to_pagebuf(list=false) =>
+// lib/bitmap.c:bitmap_print_to_pagebuf(list=false), representing a CPU bitmask
+// in which all `cores` CPUs are set.
+func fullCPUMask(cores uint) string {
+	var (
+		b   strings.Builder
+		sep string
+	)
+	if rem := cores % 32; rem != 0 {
+		cores -= rem
+		fmt.Fprintf(&b, "%x", (uint32(1)<<rem)-1)
+		sep = ","
+	}
+	for cores != 0 {
+		cores -= 32
+		fmt.Fprintf(&b, "%sffffffff", sep)
+		sep = ","
+	}
+	return b.String()
+}
+
+// oneCPUMask returns a "hex format ASCII string", consistent with Linux's
+// include/linux/cpumask.h:cpumap_print_to_pagebuf(list=false) =>
+// lib/bitmap.c:bitmap_print_to_pagebuf(list=false), representing a CPU bitmask
+// for `cores` CPUs in which only CPU `i` is set.
+//
+// Preconditions: i < cores.
+func oneCPUMask(i, cores uint) string {
+	var (
+		b   strings.Builder
+		sep string
+	)
+	word := func() (w uint32) {
+		if cores <= i {
+			w = uint32(1) << (i - cores)
+		}
+		return
+	}
+	if rem := cores % 32; rem != 0 {
+		cores -= rem
+		chars := (rem + 3) / 4 // 4 bits per hex character
+		fmt.Fprintf(&b, "%0*x", chars, word())
+		sep = ","
+	}
+	for cores != 0 {
+		cores -= 32
+		fmt.Fprintf(&b, "%s%08x", sep, word())
+		sep = ","
+	}
+	return b.String()
 }
 
 // Returns a map from a PCI device name to its IOMMU group if available.
@@ -282,7 +349,8 @@ func (fs *filesystem) mirrorIOMMUGroups(ctx context.Context, creds *auth.Credent
 			subs[dent] = fs.newHostFile(ctx, creds, defaultSysMode, absPath)
 		case unix.S_IFLNK:
 			if pciDeviceRegex.MatchString(dent) {
-				subs[dent] = kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), fmt.Sprintf("../../../../devices/pci0000:00/%s", dent))
+				pciBus := pciBusFromAddress(dent)
+				subs[dent] = kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), fmt.Sprintf("../../../../devices/pci%s/%s", pciBus, dent))
 			}
 		}
 	}

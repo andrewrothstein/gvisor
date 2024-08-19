@@ -100,3 +100,14 @@ type hasFrontendFDPtr[T any] interface {
 	marshalPtr[T]
 	nvgpu.HasFrontendFD
 }
+
+type hasCtrlInfoListPtr[T any] interface {
+	marshalPtr[T]
+	nvgpu.HasCtrlInfoList
+}
+
+// NvidiaDeviceFD is an interface that should be implemented by all
+// vfs.FileDescriptionImpl of Nvidia devices.
+type NvidiaDeviceFD interface {
+	IsNvidiaDeviceFD()
+}

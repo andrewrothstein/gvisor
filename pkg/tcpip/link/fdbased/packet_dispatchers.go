@@ -20,9 +20,9 @@ package fdbased
 import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/link/stopfd"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/stack/gro"
@@ -31,6 +31,7 @@ import (
 // BufConfig defines the shape of the buffer used to read packets from the NIC.
 var BufConfig = []int{128, 256, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768}
 
+// +stateify savable
 type iovecBuffer struct {
 	// buffer is the actual buffer that holds the packet contents. Some contents
 	// are reused across calls to pullBuffer if number of requested bytes is
@@ -145,6 +146,8 @@ func (b *iovecBuffer) release() {
 
 // readVDispatcher uses readv() system call to read inbound packets and
 // dispatches them.
+//
+// +stateify savable
 type readVDispatcher struct {
 	stopfd.StopFD
 	// fd is the file descriptor used to send and receive packets.
@@ -184,9 +187,9 @@ func (d *readVDispatcher) release() {
 
 // dispatch reads one packet from the file descriptor and dispatches it.
 func (d *readVDispatcher) dispatch() (bool, tcpip.Error) {
-	n, err := rawfile.BlockingReadvUntilStopped(d.EFD, d.fd, d.buf.nextIovecs())
-	if n <= 0 || err != nil {
-		return false, err
+	n, errno := rawfile.BlockingReadvUntilStopped(d.EFD, d.fd, d.buf.nextIovecs())
+	if n <= 0 || errno != 0 {
+		return false, tcpip.TranslateErrno(errno)
 	}
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
@@ -207,6 +210,8 @@ func (d *readVDispatcher) dispatch() (bool, tcpip.Error) {
 
 // recvMMsgDispatcher uses the recvmmsg system call to read inbound packets and
 // dispatches them.
+//
+// +stateify savable
 type recvMMsgDispatcher struct {
 	stopfd.StopFD
 	// fd is the file descriptor used to send and receive packets.
@@ -285,9 +290,12 @@ func (d *recvMMsgDispatcher) dispatch() (bool, tcpip.Error) {
 		d.msgHdrs[k].Msg.SetIovlen(iovLen)
 	}
 
-	nMsgs, err := rawfile.BlockingRecvMMsgUntilStopped(d.EFD, d.fd, d.msgHdrs)
-	if nMsgs == -1 || err != nil {
-		return false, err
+	nMsgs, errno := rawfile.BlockingRecvMMsgUntilStopped(d.EFD, d.fd, d.msgHdrs)
+	if errno != 0 {
+		return false, tcpip.TranslateErrno(errno)
+	}
+	if nMsgs == -1 {
+		return false, nil
 	}
 
 	// Process each of received packets.

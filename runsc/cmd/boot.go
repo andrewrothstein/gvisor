@@ -36,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/ring0"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/util"
@@ -138,6 +139,8 @@ type Boot struct {
 
 	sinkFDs intFlags
 
+	saveFDs intFlags
+
 	// pidns is set if the sandbox is in its own pid namespace.
 	pidns bool
 
@@ -149,6 +152,9 @@ type Boot struct {
 	// productName is the value to show in
 	// /sys/devices/virtual/dmi/id/product_name.
 	productName string
+
+	// Value of /sys/kernel/mm/transparent_hugepage/shmem_enabled on the host.
+	hostShmemHuge string
 
 	// FDs for profile data.
 	profileFDs profile.FDArgs
@@ -202,6 +208,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&b.attached, "attached", false, "if attached is true, kills the sandbox process when the parent process terminates")
 	f.StringVar(&b.productName, "product-name", "", "value to show in /sys/devices/virtual/dmi/id/product_name")
 	f.StringVar(&b.nvidiaDriverVersion, "nvidia-driver-version", "", "Nvidia driver version on the host")
+	f.StringVar(&b.hostShmemHuge, "host-shmem-huge", "", "value of /sys/kernel/mm/transparent_hugepage/shmem_enabled on the host")
 
 	// Open FDs that are donated to the sandbox.
 	f.IntVar(&b.specFD, "spec-fd", -1, "required fd with the container spec")
@@ -219,6 +226,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&b.mountsFD, "mounts-fd", -1, "mountsFD is an optional file descriptor to read list of mounts after they have been resolved (direct paths, no symlinks).")
 	f.IntVar(&b.podInitConfigFD, "pod-init-config-fd", -1, "file descriptor to the pod init configuration file.")
 	f.Var(&b.sinkFDs, "sink-fds", "ordered list of file descriptors to be used by the sinks defined in --pod-init-config.")
+	f.Var(&b.saveFDs, "save-fds", "ordered list of file descriptors to be used save checkpoints. Order: kernel state, page metadata, page file")
 
 	// Profiling flags.
 	b.profileFDs.SetFromFlags(f)
@@ -246,14 +254,25 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	ring0.InitDefault()
 
 	argOverride := make(map[string]string)
+
+	// Do these before chroot takes effect, otherwise we can't read /sys.
 	if len(b.productName) == 0 {
-		// Do this before chroot takes effect, otherwise we can't read /sys.
 		if product, err := ioutil.ReadFile("/sys/devices/virtual/dmi/id/product_name"); err != nil {
 			log.Warningf("Not setting product_name: %v", err)
 		} else {
 			b.productName = strings.TrimSpace(string(product))
 			log.Infof("Setting product_name: %q", b.productName)
 			argOverride["product-name"] = b.productName
+		}
+	}
+	if conf.AppHugePages && len(b.hostShmemHuge) == 0 {
+		hostShmemHuge, err := hostmm.GetTransparentHugepageEnum("shmem_enabled")
+		if err != nil {
+			log.Warningf("Failed to infer --host-shmem-huge: %v", err)
+		} else {
+			b.hostShmemHuge = hostShmemHuge
+			log.Infof("Setting host-shmem-huge: %q", b.hostShmemHuge)
+			argOverride["host-shmem-huge"] = b.hostShmemHuge
 		}
 	}
 
@@ -453,6 +472,8 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		SinkFDs:             b.sinkFDs.GetArray(),
 		ProfileOpts:         b.profileFDs.ToOpts(),
 		NvidiaDriverVersion: b.nvidiaDriverVersion,
+		HostShmemHuge:       b.hostShmemHuge,
+		SaveFDs:             b.saveFDs.GetFDs(),
 	}
 	l, err := boot.New(bootArgs)
 	if err != nil {
@@ -469,17 +490,6 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 			// Umount /proc right before installing seccomp filters.
 			umountProc(b.procMountSyncFD)
 		}
-	}
-
-	if conf.TestOnlyAutosaveImagePath != "" {
-		fName := filepath.Join(conf.TestOnlyAutosaveImagePath, boot.CheckpointStateFileName)
-		f, err := os.OpenFile(fName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
-		if err != nil {
-			util.Fatalf("error in creating state file %v", err)
-		}
-		defer f.Close()
-
-		boot.EnableAutosave(l, f, conf.TestOnlyAutosaveResume)
 	}
 
 	// Prepare metrics.

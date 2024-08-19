@@ -23,9 +23,9 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/link/stopfd"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -115,6 +115,8 @@ func (t tPacketHdr) Payload() []byte {
 
 // packetMMapDispatcher uses PACKET_RX_RING's to read/dispatch inbound packets.
 // See: mmap_amd64_unsafe.go for implementation details.
+//
+// +stateify savable
 type packetMMapDispatcher struct {
 	stopfd.StopFD
 	// fd is the file descriptor used to send and receive packets.
@@ -148,7 +150,7 @@ func (d *packetMMapDispatcher) readMMappedPackets() (stack.PacketBufferList, boo
 			if errno == unix.EINTR {
 				continue
 			}
-			return pkts, stopped, rawfile.TranslateErrno(errno)
+			return pkts, stopped, tcpip.TranslateErrno(errno)
 		}
 		if stopped {
 			return pkts, true, nil

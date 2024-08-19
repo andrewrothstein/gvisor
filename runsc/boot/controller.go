@@ -72,6 +72,12 @@ const (
 	// ContMgrRestoreSubcontainer restores a container from a statefile.
 	ContMgrRestoreSubcontainer = "containerManager.RestoreSubcontainer"
 
+	// ContMgrPause pauses all tasks, blocking until they are stopped.
+	ContMgrPause = "containerManager.Pause"
+
+	// ContMgrResume resumes all tasks.
+	ContMgrResume = "containerManager.Resume"
+
 	// ContMgrSignal sends a signal to a container.
 	ContMgrSignal = "containerManager.Signal"
 
@@ -85,6 +91,13 @@ const (
 	// ContMgrWaitPID waits on a process with a certain PID in the sandbox and
 	// return its ExitStatus.
 	ContMgrWaitPID = "containerManager.WaitPID"
+
+	// ContMgrWaitCheckpoint waits for the Kernel to have been successfully
+	// checkpointed n-1 times, then waits for either the n-th successful
+	// checkpoint (in which case it returns nil) or any number of failed
+	// checkpoints (in which case it returns an error returned by any such
+	// failure).
+	ContMgrWaitCheckpoint = "containerManager.WaitCheckpoint"
 
 	// ContMgrRootContainerStart starts a new sandbox with a root container.
 	ContMgrRootContainerStart = "containerManager.StartRoot"
@@ -128,12 +141,6 @@ const (
 // Logging related commands (see logging.go for more details).
 const (
 	LoggingChange = "Logging.Change"
-)
-
-// Lifecycle related commands (see lifecycle.go for more details).
-const (
-	LifecyclePause  = "Lifecycle.Pause"
-	LifecycleResume = "Lifecycle.Resume"
 )
 
 // Usage related commands (see usage.go for more details).
@@ -180,29 +187,42 @@ func newController(fd int, l *Loader) (*controller, error) {
 		},
 		srv: srv,
 	}
-	ctrl.srv.Register(ctrl.manager)
-	ctrl.srv.Register(&control.Cgroups{Kernel: l.k})
-	ctrl.srv.Register(&control.Lifecycle{Kernel: l.k})
-	ctrl.srv.Register(&control.Logging{})
-	ctrl.srv.Register(&control.Proc{Kernel: l.k})
-	ctrl.srv.Register(&control.State{Kernel: l.k})
-	ctrl.srv.Register(&control.Usage{Kernel: l.k})
-	ctrl.srv.Register(&control.Metrics{})
-	ctrl.srv.Register(&debug{})
+	ctrl.registerHandlers()
+	return ctrl, nil
+}
+
+func (c *controller) registerHandlers() {
+	l := c.manager.l
+	c.srv.Register(c.manager)
+	c.srv.Register(&control.Cgroups{Kernel: l.k})
+	c.srv.Register(&control.Lifecycle{Kernel: l.k})
+	c.srv.Register(&control.Logging{})
+	c.srv.Register(&control.Proc{Kernel: l.k})
+	c.srv.Register(&control.State{Kernel: l.k})
+	c.srv.Register(&control.Usage{Kernel: l.k})
+	c.srv.Register(&control.Metrics{})
+	c.srv.Register(&debug{})
 
 	if eps, ok := l.k.RootNetworkNamespace().Stack().(*netstack.Stack); ok {
-		ctrl.srv.Register(&Network{
+		c.srv.Register(&Network{
 			Stack:  eps.Stack,
 			Kernel: l.k,
 		})
 	}
 	if l.root.conf.ProfileEnable {
-		ctrl.srv.Register(control.NewProfile(l.k))
+		c.srv.Register(control.NewProfile(l.k))
 	}
-	return ctrl, nil
 }
 
-// stopRPCTimeout is the time for clients to complete ongoing RPCs.
+// refreshHandlers resets the server and re-registers all handlers using l.
+// Useful when l.k has been replaced (e.g. during a restore).
+func (c *controller) refreshHandlers() {
+	c.srv.ResetServer()
+	c.registerHandlers()
+}
+
+// stopRPCTimeout is the time for clients to finish making any RPCs. Note that
+// ongoing RPCs after this timeout still run to completion.
 const stopRPCTimeout = 15 * gtime.Second
 
 func (c *controller) stop() {
@@ -468,6 +488,10 @@ type RestoreOpts struct {
 func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 	log.Debugf("containerManager.Restore")
 
+	cm.l.mu.Lock()
+	cu := cleanup.Make(cm.l.mu.Unlock)
+	defer cu.Clean()
+
 	if cm.l.state == restoring {
 		return fmt.Errorf("restore is already in progress")
 	}
@@ -494,6 +518,8 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 	cm.restorer = &restorer{restoreDone: cm.onRestoreDone, stateFile: stateFile}
 	cm.l.restoreWaiters = sync.NewCond(&cm.l.mu)
 	cm.l.state = restoring
+	// Release `cm.l.mu`.
+	cu.Clean()
 
 	fileIdx := 1
 	if o.HavePagesFile {
@@ -501,14 +527,12 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 		if err != nil {
 			return err
 		}
-		defer cm.restorer.pagesMetadata.Close()
 		fileIdx++
 
 		cm.restorer.pagesFile, err = o.ReleaseFD(fileIdx)
 		if err != nil {
 			return err
 		}
-		defer cm.restorer.pagesFile.Close()
 		fileIdx++
 	}
 
@@ -572,9 +596,12 @@ func (cm *containerManager) onRestoreDone() error {
 func (cm *containerManager) RestoreSubcontainer(args *StartArgs, _ *struct{}) error {
 	log.Debugf("containerManager.RestoreSubcontainer, cid: %s, args: %+v", args.CID, args)
 
+	cm.l.mu.Lock()
 	if cm.l.state != restoring {
+		cm.l.mu.Unlock()
 		return fmt.Errorf("sandbox is not being restored, cannot restore subcontainer")
 	}
+	cm.l.mu.Unlock()
 
 	// Validate arguments.
 	if args.Spec == nil {
@@ -644,6 +671,18 @@ func (cm *containerManager) RestoreSubcontainer(args *StartArgs, _ *struct{}) er
 	return nil
 }
 
+// Pause pauses all tasks, blocking until they are stopped.
+func (cm *containerManager) Pause(_, _ *struct{}) error {
+	cm.l.k.Pause()
+	return nil
+}
+
+// Resume resumes all tasks.
+func (cm *containerManager) Resume(_, _ *struct{}) error {
+	cm.l.k.Unpause()
+	return postResumeImpl(cm.l)
+}
+
 // Wait waits for the init process in the given container.
 func (cm *containerManager) Wait(cid *string, waitStatus *uint32) error {
 	log.Debugf("containerManager.Wait, cid: %s", *cid)
@@ -666,6 +705,16 @@ func (cm *containerManager) WaitPID(args *WaitPIDArgs, waitStatus *uint32) error
 	log.Debugf("containerManager.Wait, cid: %s, pid: %d", args.CID, args.PID)
 	err := cm.l.waitPID(kernel.ThreadID(args.PID), args.CID, waitStatus)
 	log.Debugf("containerManager.Wait, cid: %s, pid: %d, waitStatus: %#x, err: %v", args.CID, args.PID, *waitStatus, err)
+	return err
+}
+
+// WaitCheckpoint waits for the Kernel to have been successfully checkpointed
+// n-1 times, then waits for either the n-th successful checkpoint (in which
+// case it returns nil) or any number of failed checkpoints (in which case it
+// returns an error returned by any such failure).
+func (cm *containerManager) WaitCheckpoint(n *uint32, _ *struct{}) error {
+	err := cm.l.k.WaitCheckpoint(*n)
+	log.Debugf("containerManager.WaitCheckpoint, n = %d, err = %v", *n, err)
 	return err
 }
 
@@ -768,8 +817,9 @@ func (cm *containerManager) ProcfsDump(_ *struct{}, out *[]procfs.ProcessProcfsD
 	log.Debugf("containerManager.ProcfsDump")
 	ts := cm.l.k.TaskSet()
 	pidns := ts.Root
-	*out = make([]procfs.ProcessProcfsDump, 0, len(cm.l.processes))
-	for _, tg := range pidns.ThreadGroups() {
+	tgs := pidns.ThreadGroups()
+	*out = make([]procfs.ProcessProcfsDump, 0, len(tgs))
+	for _, tg := range tgs {
 		pid := pidns.IDOfThreadGroup(tg)
 		procDump, err := procfs.Dump(tg.Leader(), pid, pidns)
 		if err != nil {
@@ -808,6 +858,8 @@ func (cm *containerManager) Mount(args *MountArgs, _ *struct{}) error {
 	var cu cleanup.Cleanup
 	defer cu.Clean()
 
+	cm.l.mu.Lock()
+	defer cm.l.mu.Unlock()
 	eid := execID{cid: args.ContainerID}
 	ep, ok := cm.l.processes[eid]
 	if !ok {
